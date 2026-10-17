@@ -41,6 +41,7 @@
 // Clarity keeps every low-pass at or above clarity_floor, except band-limited
 // ones (high-pass above 150 Hz: the game's phone/TV/radio speaker effect), and
 // opens high shelves above 4 kHz that cut.
+// 0.6.1: the menu is one table (src/menu.inc) exported as esc_menu() for the VR debug menu and read by the script.
 // 0.6.0: renamed Extended Sound Control (files, settings carried over), its own
 // menu with a hotkey when Sims4VR isn't installed, esc_get / esc_set.
 // 0.5.0: Ambient boost. The game has no ambient slider; ambience is one of the
@@ -67,7 +68,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "0.6.0";
+constexpr const char* kVersion = "0.6.1";
 constexpr DWORD kStamp128 = 0x6aa08454;  // TS4_x64.exe 1.128.90.1030 (DX11)
 
 // ---------------------------------------------------------------------------
@@ -818,6 +819,15 @@ void startClarity() {
 
 std::atomic<int> g_menuPresses{0};
 
+std::atomic<bool> g_capturing{false};
+std::atomic<int> g_captured{0};
+bool g_held[256] = {};
+
+// The settings menu (src/menu.inc): the VR debug menu reads it through esc_menu(), the script through menu().
+const wchar_t kMenu[] =
+#include "menu.inc"
+    ;
+
 bool vrPresent() { return GetModuleHandleW(L"sims4vr.dll") != nullptr; }
 
 void startHotkey() {
@@ -829,7 +839,18 @@ void startHotkey() {
             HWND fg = GetForegroundWindow();
             DWORD pid = 0;
             if (fg) GetWindowThreadProcessId(fg, &pid);
-            bool now = key > 0 && key < 256 && pid == GetCurrentProcessId() && (GetAsyncKeyState(key) & 0x8000);
+            bool focused = pid == GetCurrentProcessId();
+            if (g_capturing.load()) {
+                // Choosing a new menu key: the first key that goes down (mouse buttons ignored).
+                for (int vk = 0x08; vk < 0xFF; ++vk) {
+                    bool held = focused && (GetAsyncKeyState(vk) & 0x8000);
+                    if (held && !g_held[vk] && !g_captured.load()) g_captured = vk;
+                    g_held[vk] = held;
+                }
+                down = true;
+                continue;
+            }
+            bool now = key > 0 && key < 256 && focused && (GetAsyncKeyState(key) & 0x8000);
             if (now && !down && !vrPresent()) g_menuPresses.fetch_add(1);
             down = now;
         }
@@ -928,7 +949,40 @@ PyObject* pyLog(PyObject*, PyObject* args) {
 PyObject* pyMenuPresses(PyObject*, PyObject*) { return py.Py_BuildValue("i", g_menuPresses.exchange(0)); }
 PyObject* pyHasVr(PyObject*, PyObject*) { return py.Py_BuildValue("i", vrPresent() ? 1 : 0); }
 
+// menu() -> the menu rows (jiggle/docs/MENU-EXPORT.md) as text.
+PyObject* pyMenu(PyObject*, PyObject*) { return py.Py_BuildValue("u", kMenu); }
+
+// capture(1) starts listening for a new menu key; capture(0) stops and returns the key pressed (0 = none).
+PyObject* pyCapture(PyObject*, PyObject* args) {
+    int on = 0;
+    if (!py.PyArg_ParseTuple(args, "i", &on)) return nullptr;
+    if (on) {
+        for (int vk = 0; vk < 256; ++vk) g_held[vk] = (GetAsyncKeyState(vk) & 0x8000) != 0;
+        g_captured = 0;
+        g_capturing = true;
+        return py.Py_BuildValue("i", 0);
+    }
+    g_capturing = false;
+    return py.Py_BuildValue("i", g_captured.exchange(0));
+}
+
+// key_name(vk) -> the key's name on this keyboard.
+PyObject* pyKeyName(PyObject*, PyObject* args) {
+    int vk = 0;
+    if (!py.PyArg_ParseTuple(args, "i", &vk)) return nullptr;
+    wchar_t name[64] = L"None";
+    if (vk > 0 && vk < 256) {
+        LONG scan = static_cast<LONG>(MapVirtualKeyW(vk, MAPVK_VK_TO_VSC)) << 16;
+        if (vk >= VK_PRIOR && vk <= VK_DELETE) scan |= 1 << 24;  // the arrow/navigation block, not the numpad
+        if (!scan || !GetKeyNameTextW(scan, name, 64)) swprintf(name, 64, L"key %d", vk);
+    }
+    return py.Py_BuildValue("u", name);
+}
+
 PyMethodDef methods[] = {
+    {"menu", pyMenu, METH_NOARGS, "menu() -> the menu rows as text"},
+    {"capture", pyCapture, METH_VARARGS, "capture(1) listen for a new menu key; capture(0) -> the key pressed"},
+    {"key_name", pyKeyName, METH_VARARGS, "key_name(vk) -> the key's name"},
     {"menu_presses", pyMenuPresses, METH_NOARGS, "menu hotkey presses since the last call"},
     {"has_vr", pyHasVr, METH_NOARGS, "1 when Sims4VR is loaded (it shows these settings itself)"},
     {"set", pySet, METH_VARARGS, "set(name, value) -> 1 for a known setting"},
@@ -993,6 +1047,8 @@ extern "C" __declspec(dllexport) int esc_get(const char* key, float* out) {
     return 1;
 }
 extern "C" __declspec(dllexport) int esc_set(const char* key, float value) { return setValue(key, value) ? 1 : 0; }
+// The settings menu as rows of text (src/menu.inc, format in jiggle/docs/MENU-EXPORT.md); values through esc_get / esc_set.
+extern "C" __declspec(dllexport) const wchar_t* esc_menu() { return kMenu; }
 // The names used while the mod was called Claude Sound.
 extern "C" __declspec(dllexport) int claudesound_get(const char* key, float* out) { return esc_get(key, out); }
 extern "C" __declspec(dllexport) int claudesound_set(const char* key, float value) { return esc_set(key, value); }

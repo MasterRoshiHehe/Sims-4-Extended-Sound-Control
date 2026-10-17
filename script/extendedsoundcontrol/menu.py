@@ -1,131 +1,219 @@
-"""Extended Sound Control's own menu (game picker dialogs), for players without Sims4VR (Sims4VR shows
-these settings on its VR debug menu). Opens with the menu hotkey ("." by default, set in Advanced) or the
-console command esc.menu. Basic settings on the first page, the rest under Advanced settings.
-
-Built the way the game's own pickers are (ui/ui_dialog_picker.py): a single-select UiObjectPicker with
-ObjectPickerRows; picking a setting opens a picker of its values, then the page comes back.
-"""
-
-BOOSTS = [1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0, 2.25, 2.5, 2.75, 3.0, 3.5, 4.0]
-FLOORS = [1000, 2000, 3000, 4000, 5000, 6000, 8000, 10000, 12000, 14000, 16000]
-KEYS = [(0xBE, '. (full stop)'), (0xBC, ', (comma)'), (0x78, 'F9'), (0x79, 'F10'), (0x7A, 'F11'), (0x7B, 'F12'),
-        (0x2D, 'Insert'), (0x24, 'Home'), (0, 'None')]
+"""Extended Sound Control's own settings menu in game dialogs, for players without Sims4VR (whose debug menu
+shows the same pages). Opens with the menu key ("." unless changed in the menu) or the console command esc.menu.
+The pages come from the DLL (src/menu.inc, format in jiggle/docs/MENU-EXPORT.md), the same table Sims4VR reads.
+Built the way the game's own pickers are (ui/ui_dialog_picker.py)."""
+_m = None
+_log = None
+_open = False
+_pages = None  # page id -> (parent id, title)
+_rows = None  # page id -> [row fields]
 
 
-def _percent(v):
-    return '{:.0f}%'.format(v * 100)
+def _mod():
+    return _m
 
 
-def _on_off(v):
-    return 'On' if v else 'Off'
+def open_menu(mod, log):
+    """Opens the first page (the hotkey and esc.menu); does nothing while a page is already open."""
+    global _m, _log
+    _m, _log = mod, log
+    if _open:
+        return
+    show()
 
 
-def _key_name(v):
-    for code, name in KEYS:
-        if code == int(v):
-            return name
-    return 'key {}'.format(int(v))
-
-
-# (key, label, description, kind, values, shown)
-BASIC = [
-    ('boost', 'Master boost', 'Everything louder than the game allows, through its own limiter (no crackle).',
-     'number', BOOSTS, _percent),
-    ('music_boost', 'Music boost', 'Radios, stereos and the score. On top of Master boost.', 'number', BOOSTS, _percent),
-    ('effects_boost', 'Sound effects boost', 'On top of Master boost.', 'number', BOOSTS, _percent),
-    ('voices_boost', "Voices boost", "Sims' voices. On top of Master boost.", 'number', BOOSTS, _percent),
-    ('ambient_boost', 'Ambient boost', 'Birds, wind, rain, city hum (the game has no slider). Pick the group under '
-     'Advanced first.', 'number', BOOSTS, _percent),
-    ('clarity', 'Clarity', "Stops the game muffling sounds below the Muffle floor and opens its treble cuts. "
-     "Phone, TV and radio speaker sounds stay as they are.", 'switch', [1, 0], _on_off),
-]
-ADVANCED = [
-    ('clarity_floor', 'Muffle floor', 'With Clarity on: how muffled the furthest sounds may get. Higher = clearer.',
-     'number', FLOORS, lambda v: '{:.0f} Hz'.format(v)),
-    ('ui_boost', 'UI sounds boost', 'Menu clicks and notifications.', 'number', BOOSTS, _percent),
-    ('menu_music_boost', 'Menu music boost', 'Main menu and loading music.', 'number', BOOSTS, _percent),
-    ('ambient_bus', 'Ambient sounds are', "Which of the game's 4 hidden sound groups is ambience. Each change "
-     "silences that group for 4 seconds so you can hear which one it is.", 'number', [1, 2, 3, 4],
-     lambda v: 'group {:.0f}'.format(v)),
-    ('menu_key', 'Menu hotkey', 'The key that opens this menu (when Sims4VR is not installed).', 'number',
-     [code for code, _ in KEYS], _key_name),
-    ('probe_on_load', 'Look at the mixer after each lot load', 'Writes the mixer to extendedsoundcontrol_probe.txt.',
-     'switch', [1, 0], _on_off),
-    ('probe', "Look at the game's mixer now", 'Writes the mixer and a count of playing sounds per group to the '
-     'mod folder (a few seconds).', 'action', None, None),
-]
-ADVANCED_ROW = 1000
-BACK_ROW = 1001
+def _load():
+    global _pages, _rows
+    if _pages is not None:
+        return
+    pages, rows = {}, {}
+    for line in _mod().menu().split('\n'):
+        f = line.split('\t')
+        if f[0] == 'page' and len(f) >= 4:
+            pages[f[1]] = (f[2], f[3])
+            rows.setdefault(f[1], [])
+        elif f[0] in ('link', 'switch', 'number', 'confirm', 'key') and len(f) >= 4:
+            rows.setdefault(f[1], []).append(f)
+    _pages, _rows = pages, rows
 
 
 def _raw(text):
     from sims4.localization import LocalizationHelperTuning
-    return LocalizationHelperTuning.get_raw_text(text)
+    string = LocalizationHelperTuning.get_raw_text(text)
+    return lambda *_, **__: string
 
 
-def _picker(title, text, rows, on_pick):
-    """rows: [(option_id, name, description, selected)]; on_pick(option_id) when the player picks one."""
+def _flags(f):
+    return set(x for x in f.split(',') if x)
+
+
+def _shown(f, vr):
+    """Whether the row shows: 'vr' rows only with the VR mod, 'novr' rows only without it."""
+    i = {'switch': 4, 'number': 9, 'confirm': 4, 'key': 4}.get(f[0])
+    flags = _flags(f[i] if i is not None and len(f) > i else '')
+    return not (('vr' in flags and not vr) or ('novr' in flags and vr))
+
+
+def _value(key):
+    v = _mod().get(key)
+    return 0.0 if v is None else v
+
+
+def _number_text(f, v):
+    try:
+        return f[8] % (v * float(f[7]))
+    except (TypeError, ValueError):
+        return '{:g}'.format(v)
+
+
+def _label(f):
+    kind = f[0]
+    if kind == 'link':
+        return f[2] + '  >'
+    if kind == 'switch':
+        return '{}: {}'.format(f[2], 'On' if _value(f[3]) != 0 else 'Off')
+    if kind == 'number':
+        return '{}: {}'.format(f[2], _number_text(f, _value(f[3])))
+    if kind == 'key':
+        return '{}: {}'.format(f[2], _mod().key_name(int(_value(f[3]))))
+    return f[2] + '...'
+
+
+def _tip(f):
+    return {'switch': 5, 'number': 10, 'confirm': 5, 'key': 5}.get(f[0])
+
+
+def _who():
     import services
-    from ui.ui_dialog_picker import UiObjectPicker, ObjectPickerRow
-    client = services.client_manager().get_first_client()
-    sim = client.active_sim if client is not None else None
-    if sim is None:
-        return False
-    dialog = UiObjectPicker.TunableFactory().default(
-        sim, text=lambda *_, **__: _raw(text), title=lambda *_, **__: _raw(title), min_selectable=1,
-        picker_type=UiObjectPicker.UiObjectPickerObjectPickerType.OBJECT)
-    for option_id, name, description, selected in rows:
-        dialog.add_row(ObjectPickerRow(option_id=option_id, name=_raw(name), row_description=_raw(description),
-                                       is_selected=selected))
-
-    def listener(d):
-        if d.accepted and d.picked_results:
-            on_pick(d.picked_results[0])
-
-    dialog.add_listener(listener)
-    dialog.show_dialog()
-    return True
+    return services.active_sim_info()
 
 
-def open_menu(mod, log, advanced=False):
-    entries = ADVANCED if advanced else BASIC
-    rows = []
-    for i, (key, label, description, kind, values, shown) in enumerate(entries):
-        if kind == 'action':
-            rows.append((i, label, description, False))
-        else:
-            rows.append((i, '{}: {}'.format(label, shown(mod.get(key) or 0)), description, False))
-    if advanced:
-        rows.append((BACK_ROW, 'Back', 'The basic settings.', False))
-    else:
-        rows.append((ADVANCED_ROW, 'Advanced settings', 'Muffle floor, UI and menu music, which group is ambience, '
-                     'the menu hotkey and diagnostics.', False))
-
-    def picked(option_id):
-        if option_id == ADVANCED_ROW:
-            open_menu(mod, log, True)
-        elif option_id == BACK_ROW:
-            open_menu(mod, log, False)
-        elif 0 <= option_id < len(entries):
-            _open_value(mod, log, entries[option_id], advanced)
-
-    title = 'Extended Sound Control' + (': advanced' if advanced else '')
-    if not _picker(title, 'Pick a setting to change it.', rows, picked):
-        log('Menu: no active Sim to show it to (open it while playing a lot)')
+def _closed():
+    global _open
+    _open = False
 
 
-def _open_value(mod, log, entry, advanced):
-    key, label, description, kind, values, shown = entry
-    if kind == 'action':
-        mod.set(key, 1)
-        open_menu(mod, log, advanced)
+def show(page='main'):
+    """Opens a page of the menu."""
+    global _open
+    _load()
+    owner = _who()
+    if owner is None or page not in _pages:
+        _closed()
         return
-    current = mod.get(key) or 0
-    rows = [(i, shown(v), '', abs(v - current) < 1e-3) for i, v in enumerate(values)]
+    _open = True
+    from sims4.localization import LocalizationHelperTuning
+    from ui.ui_dialog_picker import ObjectPickerRow, UiObjectPicker
+    vr = bool(_mod().has_vr())
+    parent, title = _pages[page]
+    rows = [f for f in _rows.get(page, []) if _shown(f, vr)]
+    dialog = UiObjectPicker.TunableFactory().default(
+        owner, text=_raw('Extended Sound Control settings. Pick one to change it.'), title=_raw(title),
+        min_selectable=1, max_selectable=1, picker_type=UiObjectPicker.UiObjectPickerObjectPickerType.OBJECT)
+    for i, f in enumerate(rows):
+        tip = _tip(f)
+        description = f[tip] if tip is not None and len(f) > tip else ''
+        text = LocalizationHelperTuning.get_raw_text(description) if description else None
+        dialog.add_row(ObjectPickerRow(
+            option_id=i, name=LocalizationHelperTuning.get_raw_text(_label(f)), row_description=text,
+            row_tooltip=(lambda text=text: text) if text else None, tag=tuple(f)))
 
-    def picked(option_id):
-        if 0 <= option_id < len(values):
-            mod.set(key, float(values[option_id]))
-        open_menu(mod, log, advanced)
+    def on_response(d):
+        from ui.ui_dialog import ButtonType
+        try:
+            picked = d.get_result_tags() if d.response == ButtonType.DIALOG_RESPONSE_OK else []
+            if picked:
+                _pick(page, picked[0])
+            elif d.response == ButtonType.DIALOG_RESPONSE_CANCEL and parent:
+                show(parent)
+            else:
+                _closed()
+        except Exception as e:
+            _closed()
+            _log('Menu: page {} failed: {!r}'.format(page, e))
 
-    _picker(label, description, rows, picked)
+    dialog.show_dialog(on_response=on_response)
+
+
+def _pick(page, f):
+    kind = f[0]
+    if kind == 'link':
+        show(f[3])
+    elif kind == 'switch':
+        _mod().set(f[3], 0.0 if _value(f[3]) != 0 else 1.0)
+        show(page)
+    elif kind == 'number':
+        _ask_number(page, f)
+    elif kind == 'confirm':
+        _ask_sure(page, f)
+    elif kind == 'key':
+        _ask_key(page, f)
+    else:
+        show(page)
+
+
+def _ask_number(page, f):
+    from ui.ui_dialog import ButtonType
+    from ui.ui_dialog_generic import UiDialogTextInputOkCancel
+    low, high, scale = float(f[4]), float(f[5]), float(f[7])
+    v = _value(f[3])
+    dialog = UiDialogTextInputOkCancel.TunableFactory(text_inputs=('value',)).default(
+        _who(), title=_raw(f[2]),
+        text=_raw('{}\n\nNow {}. From {} to {}.'.format(f[10], _number_text(f, v), _number_text(f, low),
+                                                          _number_text(f, high))))
+
+    def on_response(d):
+        try:
+            if d.response == ButtonType.DIALOG_RESPONSE_OK:
+                typed = d.text_input_responses.get('value', '')
+                number = ''.join(c for c in typed.replace(',', '.') if c in '+-.0123456789')
+                try:
+                    x = float(number) / scale
+                except (ValueError, ZeroDivisionError):
+                    x = None
+                if x is not None:
+                    _mod().set(f[3], min(high, max(low, x)))
+            show(page)
+        except Exception as e:
+            _closed()
+            _log('Menu: number {} failed: {!r}'.format(f[3], e))
+
+    dialog.show_dialog(on_response=on_response, text_input_overrides={'value': _raw('{:g}'.format(round(v * scale, 4)))})
+
+
+def _ask_sure(page, f):
+    from ui.ui_dialog import ButtonType, UiDialogOkCancel
+    dialog = UiDialogOkCancel.TunableFactory().default(_who(), title=_raw(f[2]), text=_raw(f[5] + '\n\nAre you sure?'))
+
+    def on_response(d):
+        try:
+            if d.response == ButtonType.DIALOG_RESPONSE_OK:
+                _mod().set(f[3], 1.0)
+            show(page)
+        except Exception as e:
+            _closed()
+            _log('Menu: confirm {} failed: {!r}'.format(f[3], e))
+
+    dialog.show_dialog(on_response=on_response)
+
+
+def _ask_key(page, f):
+    from ui.ui_dialog import ButtonType, UiDialogOkCancel
+    _mod().capture(1)
+    dialog = UiDialogOkCancel.TunableFactory().default(
+        _who(), title=_raw(f[2]),
+        text=_raw('Press the key you want for this menu, then click OK.\n\nNow: {}'.format(
+            _mod().key_name(int(_value(f[3]))))))
+
+    def on_response(d):
+        try:
+            vk = _mod().capture(0)
+            if d.response == ButtonType.DIALOG_RESPONSE_OK and vk:
+                _mod().set(f[3], float(vk))
+                _log('Menu: menu key now {}'.format(_mod().key_name(vk)))
+            show(page)
+        except Exception as e:
+            _closed()
+            _log('Menu: key failed: {!r}'.format(e))
+
+    dialog.show_dialog(on_response=on_response)

@@ -7,7 +7,7 @@ Console (Ctrl+Shift+C): esc.menu | esc.boost <percent> | esc.clarity <0/1> [floo
 """
 import os
 
-VERSION = '0.6.0'
+VERSION = '0.6.1'
 DLL_NAME = 'extendedsoundcontrol.dll'
 
 _mod = None
