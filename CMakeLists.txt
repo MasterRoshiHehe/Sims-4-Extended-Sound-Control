@@ -1,0 +1,11 @@
+cmake_minimum_required(VERSION 3.16)
+project(extendedsoundcontrol CXX)
+set(CMAKE_CXX_STANDARD 17)
+
+add_library(extendedsoundcontrol SHARED src/sound.cpp)
+set_target_properties(extendedsoundcontrol PROPERTIES PREFIX "" OUTPUT_NAME extendedsoundcontrol)
+target_compile_definitions(extendedsoundcontrol PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+if(MINGW)
+    target_compile_options(extendedsoundcontrol PRIVATE -O2 -Wall)
+    target_link_options(extendedsoundcontrol PRIVATE -static -s)
+endif()
