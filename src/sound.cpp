@@ -42,6 +42,8 @@
 // ones (high-pass above 150 Hz: the game's phone/TV/radio speaker effect), and
 // opens high shelves above 4 kHz that cut.
 // 0.6.1: the menu is one table (src/menu.inc) exported as esc_menu() for the VR debug menu and read by the script.
+// 0.6.2: esc_quiet("music", gain) for other mods (Claude Bustin Out holds the game's music down while
+// its drive runs): music and menu music at gain x their level until set back to 1; never saved.
 // 0.6.0: renamed Extended Sound Control (files, settings carried over), its own
 // menu with a hotkey when Sims4VR isn't installed, esc_get / esc_set.
 // 0.5.0: Ambient boost. The game has no ambient slider; ambience is one of the
@@ -68,7 +70,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "0.6.1";
+constexpr const char* kVersion = "0.6.2";
 constexpr DWORD kStamp128 = 0x6aa08454;  // TS4_x64.exe 1.128.90.1030 (DX11)
 
 // ---------------------------------------------------------------------------
@@ -494,6 +496,7 @@ constexpr const char* kBusName[] = {"(no slider)", "menu music", "UI", "(no slid
                                     "(no slider)", "sound effects"};
 constexpr size_t kKnownBuses = sizeof(kBusChannels) / sizeof(kBusChannels[0]);
 std::atomic<bool> g_named{false};  // the buses match the measured layout: the category boosts apply
+std::atomic<float> g_quietMusic{1};  // esc_quiet: the music and menu music buses at this (0 .. 1), not saved
 
 bool findBuses() {
     uint64_t scanned = 0;
@@ -604,6 +607,8 @@ bool applyBoost() {
         if (ambient) factor *= val(kAmbientBoost);
         float want = factor > 1.0001f ? b.base * factor : b.base;
         if (ambient && GetTickCount64() < g_muteUntil) want = 0;
+        if (g_named && i < kKnownBuses && (kBusBoost[i] == kMusicBoost || kBusBoost[i] == kMenuMusicBoost))
+            want *= g_quietMusic.load();
         if (b.written < 0 && want == b.base) continue;  // nothing of ours there
         if (want != now && !writeMemory(b.send + kParams, &want, 4)) return false;
         b.written = want == b.base ? -1 : want;
@@ -1047,6 +1052,15 @@ extern "C" __declspec(dllexport) int esc_get(const char* key, float* out) {
     return 1;
 }
 extern "C" __declspec(dllexport) int esc_set(const char* key, float value) { return setValue(key, value) ? 1 : 0; }
+// For other mods (Claude Bustin Out's drive): the game's music ("music": the music and menu music buses) at
+// gain (0 .. 1) of its level until set back to 1; not a setting, never saved. 1 = the buses are known (it
+// applies within a quarter second), 0 = they aren't (yet).
+extern "C" __declspec(dllexport) int esc_quiet(const char* what, float gain) {
+    if (!what || std::strcmp(what, "music") != 0 || !std::isfinite(gain)) return 0;
+    gain = std::fmin(1.0f, std::fmax(0.0f, gain));
+    if (g_quietMusic.exchange(gain) != gain) LOG("Music held at %.0f %% by another mod (esc_quiet)", gain * 100);
+    return g_named.load() && g_busCount.load() > 0 ? 1 : 0;
+}
 // The settings menu as rows of text (src/menu.inc, format in jiggle/docs/MENU-EXPORT.md); values through esc_get / esc_set.
 extern "C" __declspec(dllexport) const wchar_t* esc_menu() { return kMenu; }
 // The names used while the mod was called Claude Sound.
