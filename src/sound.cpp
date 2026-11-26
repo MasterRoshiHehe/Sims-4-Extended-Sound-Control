@@ -74,7 +74,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "0.9.7";
+constexpr const char* kVersion = "0.9.8";
 constexpr DWORD kStamp128 = 0x6aa08454;  // TS4_x64.exe 1.128.90.1030 (DX11)
 
 // ---------------------------------------------------------------------------
