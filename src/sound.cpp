@@ -74,7 +74,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "0.9.6";
+constexpr const char* kVersion = "0.9.7";
 constexpr DWORD kStamp128 = 0x6aa08454;  // TS4_x64.exe 1.128.90.1030 (DX11)
 
 // ---------------------------------------------------------------------------
@@ -132,7 +132,8 @@ Value g_values[] = {
     {"hrtf_strength", 1, {1}},        // 0 .. 1: how much of the binaural effect (0 = none, the game's sound)
     {"hrtf_rear", 1, {1}},            // 0 .. 1.5: how strongly sounds behind you are dulled
     {"hrtf_stereo", 1, {1}},          // 1: also make stereo sources (music, radios, TV) binaural, from their left+right mix
-    {"hrtf_mirror", 0, {0}},          // 1: mirror left and right (new key: 0.9.0 saved hrtf_flip = 1 for the then-wrong direction)
+    {"hrtf_mirror", 0, {0}},
+    {"hrtf_close", 1, {1}},           // 1: sounds closer than 1 m (a Sim next to you, scenes) keep their direction instead of sliding into the middle of the head          // 1: mirror left and right (new key: 0.9.0 saved hrtf_flip = 1 for the then-wrong direction)
     {"muffle", 1, {1}},               // 1: sounds heard through walls, floors and closed doors are muffled
     {"muffle_amount", 1, {1}},        // 0 .. 1: how strong the muffling is
     {"muffle_treble", 400, {400}},    // Hz: how dull a fully blocked sound gets (200 .. 4000)
@@ -140,10 +141,11 @@ Value g_values[] = {
     {"reverb", 1, {1}},               // 1: room reverb on every positioned sound
     {"reverb_amount", 0.25f, {0.25f}},// 0 .. 1: how much reverb is mixed in
     {"reverb_size", 0.5f, {0.5f}},    // 0 .. 1: small furnished room .. big empty hall (used when the VR mod gives no room)
-    {"reverb_damp", 0.5f, {0.5f}},    // 0 .. 1: soft furnishings soak up treble in the tail
+    {"reverb_damp", 0.5f, {0.5f}},
+    {"reverb_outdoor", 0.15f, {0.15f}},// 0 .. 1: how much reverb there is outdoors (open air has almost none)    // 0 .. 1: soft furnishings soak up treble in the tail
 };
 enum { kProbe, kProbeOnLoad, kBoost, kMusicBoost, kEffectsBoost, kVoicesBoost, kUiBoost, kMenuMusicBoost,
-       kAmbientBoost, kAmbientBus, kMenuKey, kClarity, kClarityFloor, kPanLog, kHrtf, kHrtfSA, kHrtfStrength, kHrtfRear, kHrtfStereo, kHrtfFlip, kMuffle, kMuffleAmount, kMuffleTreble, kMuffleLoss, kReverb, kReverbAmount, kReverbSize, kReverbDamp, kValues };
+       kAmbientBoost, kAmbientBus, kMenuKey, kClarity, kClarityFloor, kPanLog, kHrtf, kHrtfSA, kHrtfStrength, kHrtfRear, kHrtfStereo, kHrtfFlip, kHrtfClose, kMuffle, kMuffleAmount, kMuffleTreble, kMuffleLoss, kReverb, kReverbAmount, kReverbSize, kReverbDamp, kReverbOutdoor, kValues };
 static_assert(sizeof(g_values) / sizeof(g_values[0]) == kValues, "g_values and its enum differ");
 float val(int i) { return g_values[i].v.load(std::memory_order_relaxed); }
 
@@ -233,10 +235,10 @@ bool setValue(const char* key, float f) {
         f = std::min(4.0f, std::max(1.0f, std::round(f)));
         g_muteUntil = GetTickCount64() + 4000;  // let the player hear which sounds drop out
     }
-    if (v == &g_values[kPanLog] || v == &g_values[kHrtf] || v == &g_values[kHrtfSA] || v == &g_values[kHrtfStereo] || v == &g_values[kHrtfFlip] || v == &g_values[kReverb] || v == &g_values[kMuffle]) f = f != 0 ? 1.0f : 0.0f;
+    if (v == &g_values[kPanLog] || v == &g_values[kHrtf] || v == &g_values[kHrtfSA] || v == &g_values[kHrtfStereo] || v == &g_values[kHrtfFlip] || v == &g_values[kReverb] || v == &g_values[kMuffle] || v == &g_values[kHrtfClose]) f = f != 0 ? 1.0f : 0.0f;
     if (v == &g_values[kMuffleAmount] || v == &g_values[kMuffleLoss]) f = std::min(1.0f, std::max(0.0f, f));
     if (v == &g_values[kMuffleTreble]) f = std::min(4000.0f, std::max(200.0f, f));
-    if (v == &g_values[kReverbAmount] || v == &g_values[kReverbSize] || v == &g_values[kReverbDamp]) f = std::min(1.0f, std::max(0.0f, f));
+    if (v == &g_values[kReverbAmount] || v == &g_values[kReverbSize] || v == &g_values[kReverbDamp] || v == &g_values[kReverbOutdoor]) f = std::min(1.0f, std::max(0.0f, f));
     if (v == &g_values[kHrtfStrength]) f = std::min(1.0f, std::max(0.0f, f));
     if (v == &g_values[kHrtfRear]) f = std::min(1.5f, std::max(0.0f, f));
     if (v == &g_values[kClarityFloor]) f = std::min(20000.0f, std::max(500.0f, f));
@@ -1144,8 +1146,12 @@ std::atomic<uint32_t> g_roomTick{0};
 std::atomic<float> g_pyRoomVolume{0}, g_pyRoomAbsorb{0};  // the script's own estimate (used when the VR mod gives none)
 std::atomic<uint32_t> g_pyRoomTick{0};
 
-void roomParams(float& size01, float& damp01) {
+std::atomic<float> g_smSize{-1}, g_smDamp{0}, g_smOpen{0};  // eased room values (rooms change smoothly, not in jumps)
+std::atomic<uint32_t> g_smTick{0};
+
+void roomParams(float& size01, float& damp01, float* openAir = nullptr) {
     size01 = val(kReverbSize), damp01 = val(kReverbDamp);
+    float open = 0;
     // The VR mod's room (esc_set_room) wins, then this mod's own script estimate, then the menu.
     const uint32_t now = GetTickCount();
     float vol = 0, ab = 0;
@@ -1154,9 +1160,25 @@ void roomParams(float& size01, float& damp01) {
     else if (g_pyRoomVolume.load(std::memory_order_relaxed) > 0 && now - g_pyRoomTick.load(std::memory_order_relaxed) < 5000)
         vol = g_pyRoomVolume.load(std::memory_order_relaxed), ab = g_pyRoomAbsorb.load(std::memory_order_relaxed);
     if (vol > 0) {
-        size01 = std::min(1.0f, std::max(0.0f, (std::cbrt(vol) - 1.5f) / 8.0f));
+        // log scale: 12 m3 (a closet) .. 1000 m3 (a hall) is 0 .. 1; a room over 1500 m3 is the open air
+        size01 = std::min(1.0f, std::max(0.0f, (std::log2(vol) - 3.5f) / 6.5f));
         damp01 = std::min(1.0f, std::max(0.0f, ab));
+        open = vol >= 1500.0f ? 1.0f : 0.0f;
     }
+    // ease towards the target (about a second), so the tail follows you through a door instead of jumping
+    float sz = g_smSize.load(std::memory_order_relaxed);
+    const uint32_t t = GetTickCount(), last = g_smTick.load(std::memory_order_relaxed);
+    if (sz < 0) sz = size01, g_smDamp.store(damp01), g_smOpen.store(open);
+    else if (t != last) {
+        float k = std::min(1.0f, static_cast<float>(t - last) / 1000.0f);
+        sz += (size01 - sz) * k;
+        g_smDamp.store(g_smDamp.load() + (damp01 - g_smDamp.load()) * k);
+        g_smOpen.store(g_smOpen.load() + (open - g_smOpen.load()) * k);
+    }
+    g_smSize.store(sz);
+    g_smTick.store(t);
+    size01 = sz, damp01 = g_smDamp.load();
+    if (openAir) *openAir = g_smOpen.load();
 }
 
 void startReverb(HrtfVoice& v) {
@@ -1172,11 +1194,11 @@ void startReverb(HrtfVoice& v) {
 void addReverb(HrtfVoice& v, const float* in, float* left, float* right, float directness) {
     if (!v.rev) startReverb(v);
     Reverb& r = *v.rev;
-    float size01, damp01;
-    roomParams(size01, damp01);
-    float fb = 0.70f + 0.27f * size01, d = 0.1f + 0.8f * damp01;
+    float size01, damp01, open;
+    roomParams(size01, damp01, &open);
+    float fb = 0.62f + 0.30f * size01, d = 0.15f + 0.75f * damp01;
     // farther sounds carry more reverb relative to the direct sound
-    float wet = val(kReverbAmount) * 0.35f * (1.0f + 0.8f * (1.0f - std::min(1.0f, std::max(0.0f, directness))));
+    float wet = val(kReverbAmount) * (1.0f - open * (1.0f - val(kReverbOutdoor))) * 0.35f * (1.0f + 0.8f * (1.0f - std::min(1.0f, std::max(0.0f, directness))));
     for (int n = 0; n < kBlock; ++n) {
         float x = in[n] * 0.05f, c[4];
         for (int i = 0; i < 4; ++i) {
@@ -1233,11 +1255,20 @@ HrtfVoice* voiceFor(uint64_t key) {
 float onePole(float cutoff, float fs) { return cutoff >= 18000.0f ? 1.0f : 1.0f - std::exp(-6.2831853f * cutoff / fs); }
 
 // in: 256 mono samples; out: 256 left + 256 right samples (separate arrays).
+// How much of the binaural effect a sound gets. The game's "directness" falls below 1 for sounds closer than their
+// near radius (it spreads them to the middle of the head); with hrtf_close on, only sounds practically inside the
+// head (under ~5 cm) are spread, so a Sim 30 cm away still plays from where they are.
+float spatialAmount(float directness) {
+    float d = std::min(1.0f, std::max(0.0f, directness));
+    if (val(kHrtfClose) != 0) d = std::min(1.0f, std::max(0.0f, (d - 0.05f) / 0.2f));
+    return d;
+}
+
 void renderBinaural(HrtfVoice& v, const float* in, float* left, float* right, float angleDeg, float elevDeg, float directness) {
     constexpr float kFs = 48000.0f, kHeadRadius = 0.0875f, kSpeed = 343.0f, kBase = 0.75f;
     float th = angleDeg * 0.017453292f;  // the game's angle grows towards the right (tested in game 2026-11-04)
     if (val(kHrtfFlip) != 0) th = -th;
-    float s = std::min(1.0f, std::max(0.0f, directness)) * val(kHrtfStrength);
+    float s = spatialAmount(directness) * val(kHrtfStrength);
     float sinT = std::sin(th), cosT = std::cos(th);
     float lat = sinT * s;  // + = the sound is on the right
     float aLat = std::fabs(lat);
@@ -1385,7 +1416,7 @@ bool renderSteam(HrtfVoice& v, const float* in, float* left, float* right, float
     IPLBinauralEffectParams params{};
     params.direction = {std::sin(az) * std::cos(el), std::sin(el), -std::cos(az) * std::cos(el)};
     params.interpolation = IPL_HRTFINTERPOLATION_BILINEAR;
-    params.spatialBlend = std::min(1.0f, std::max(0.0f, directness)) * val(kHrtfStrength);
+    params.spatialBlend = spatialAmount(directness) * val(kHrtfStrength);
     params.hrtf = g_sa.hrtf;
     float* inCh[1] = {const_cast<float*>(in)};
     float* outCh[2] = {left, right};

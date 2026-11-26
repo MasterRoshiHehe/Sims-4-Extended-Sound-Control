@@ -18,6 +18,7 @@ number	hrtf	Strength	hrtf_strength	0	1	0.05	100	%.0f%%		0 = the game's own sound
 number	hrtf	Dull sounds behind you	hrtf_rear	0	1.5	0.05	100	%.0f%%		How much sounds behind you lose their treble, which is how the ear tells front from back.
 switch	hrtf	Steam Audio HRTF	hrtf_sa		Use Steam Audio's measured HRTF (phonon.dll in the mod folder; a hrtf.sofa file there replaces its built-in set) instead of the built-in head model. Also gives height once the VR mod passes it.
 switch	hrtf	Stereo sounds too (music, radio, TV)	hrtf_stereo		Also place stereo sounds in 3D from their left and right mix. Turn off if music sounds thin.
+switch	hrtf	Close sounds keep direction	hrtf_close		A Sim or sound within 1 m stays where it is instead of sliding into the middle of your head (scenes, voices).
 switch	hrtf	Mirror left and right	hrtf_mirror		Turn this on if a sound on your right plays on your left.
 page	muffle	main	Extended Sound Control: muffle
 switch	muffle	Muffle through walls	muffle		Sounds from another room, floor or behind a closed door get dull and quieter. Needs the VR mod to report the walls.
@@ -29,6 +30,7 @@ switch	reverb	Room reverb	reverb		A tail on every sound with a place in the worl
 number	reverb	Amount	reverb_amount	0	1	0.05	100	%.0f%%		How much reverb is mixed in.
 number	reverb	Room size	reverb_size	0	1	0.05	100	%.0f%%		Small packed room to big empty hall. Used until the VR mod reports the real room.
 number	reverb	Soft furnishings	reverb_damp	0	1	0.05	100	%.0f%%		Carpets, curtains and furniture soak up the treble of the tail.
+number	reverb	Outdoor reverb	reverb_outdoor	0	1	0.05	100	%.0f%%		How much reverb there is outside. Open air has very little.
 page	advanced	main	Extended Sound Control: advanced
 number	advanced	Muffle floor	clarity_floor	500	20000	500	1	%.0f Hz		With Clarity on: how muffled the furthest sounds may get. Higher = clearer.
 number	advanced	UI sounds boost	ui_boost	1	4	0.05	100	%.0f%%		Menu clicks and notifications.
