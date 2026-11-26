@@ -1,55 +1,29 @@
-[![Support me on Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/masterroshihehe)
+# Extended Sound Control (formerly Claude Sound)
 
-# Extended Sound Control
+Standalone Sims 4 sound settings mod (game 1.128.90.1030, DX11), renamed 2026-10-17 (user). Works with or
+without Sims4VR: without it, its own menu (script/extendedsoundcontrol/menu.py, game pickers) opens with a
+hotkey ("." by default); with it, the VR debug menu shows the settings through `esc_get` / `esc_set`
+(rows spec: docs/VR-ROWS.md; `claudesound_get/set` kept as aliases). Settings carry over from claudesound_user.ini.
 
-A standalone sound mod for The Sims 4 (PC). It goes past the game's own volume sliders: boost
-the master volume and each sound category beyond 100 %, bring up ambient sound that has no
-slider in the game, and change how sound is muffled and how it fades with distance.
+- `src/sound.cpp`: the DLL (also the Python extension module `_extendedsoundcontrol`). Exe stamp gate 0x6aa08454.
+- `src/audio_classes.h`: EA::Audio::Core vtables of 1.128 (generated from sims4vr/re/exe/6aa08454/classes.tsv;
+  regenerate after a game patch).
+- `script/extendedsoundcontrol/`: loads the DLL, menu + hotkey, console `esc.menu`, `esc.status`, `esc.probe`...
+- `config/extendedsoundcontrol.ini`: settings ([sound]); changes in game go to extendedsoundcontrol_user.ini.
+- Design and plan: DESIGN.md; research: FEASIBILITY.md; tests: docs/NEEDS-TESTING.md.
 
-> **This mod is 100% vibe coded.** Every line of code was written by Claude (Anthropic's AI).
-> I ([MasterRoshiHehe](https://ko-fi.com/masterroshihehe)) act as the director: I decide what
-> the mod should do, test every build and report what works and what doesn't.
-> I don't write the code myself. Expect bugs, and read the code before you trust it.
+0.1.0 = probe only: scans the game's memory (ReadProcessMemory, so it can't crash) for audio plug-in objects
+by vtable and writes their bytes, links between them and what changes over 3 s to claudesound_probe.txt.
+Changes no sound, hooks nothing.
 
-**Status: early development.** Things change and break often.
+Build (Linux): `cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=tools/mingw-toolchain.cmake -DCMAKE_BUILD_TYPE=Release && cmake --build build`
+(mingw posix variant); script: `python3.7 -I tools/build_script.py <out>`.
+Package: `extendedsoundcontrol/` with the .dll, .ts4script, .ini and empty .log + _probe.txt (+ empty
+extendedsoundcontrol_user.ini on the FIRST install only, so MO2 keeps writes in the mod folder; the DLL then still
+carries Claude Sound settings over) -> the user's mod folder (currently `D:\Modding\Sims 4\mods\Claude Sound Mod\`). Sources -> `D:\Modding\Sims 4\mods\Claude Sound Workspace\`.
+Releases in release/<version>. Never hook a function sims4vr hooks (listener, ambience, PlaySound wrap).
 
-## Features
-
-- Master boost above 100 % that still goes through the game's own limiter.
-- Separate boosts for music, sound effects, voices, UI and menu music.
-- Ambient sound level (the game has no slider for it).
-- Clarity: how much walls and distance muffle sound.
-- Works on its own. With [Sims4VR](https://github.com/MasterRoshiHehe/Sims4VR) installed, its
-  settings also show up in the VR debug menu.
-
-## Settings
-
-Open the settings menu in game with the hotkey (default: `.` on the keyboard, changeable in the
-menu). The first page has the everyday settings; the rest is under **Advanced**.
-All settings are also in the mod's `.ini` file.
-
-## Requirements
-
-- The Sims 4 on PC. Supported game version: 1.128.90.1030.
-- Script mods enabled in the game (Options > Game Options > Other).
-
-## Install
-
-1. There is no release yet: the mod is in early development. When there is one, download the zip from the [Releases](../../releases) page. Until then, build it from source (below).
-2. Unzip it into `Documents/Electronic Arts/The Sims 4/Mods/`.
-
-## Building from source
-
-Cross-compiled on Linux with MinGW-w64 and CMake; the script part needs Python 3.7 for its `.pyc` files.
-
-```sh
-cmake -B build -DCMAKE_TOOLCHAIN_FILE=tools/mingw-toolchain.cmake -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
-```
-
-## License
-
-MIT, see [LICENSE](LICENSE). Third-party libraries keep their own licenses.
-
-The Sims 4 is a trademark of Electronic Arts Inc. This is a fan-made mod and is not affiliated
-with or endorsed by Electronic Arts.
+Exports for other mods: `esc_quiet("music", gain)` (0.6.2, 2026-10-27, for Claude Bustin Out): holds the music
+and menu-music buses at gain 0..1 on top of the user's settings until called again with 1; returns 1 when the
+buses are found (named), 0 otherwise. Bustin' Out calls it via GetModuleHandle + GetProcAddress for a whole drive
+so the game's map keeps its sound effects without its music.

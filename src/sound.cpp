@@ -66,11 +66,15 @@
 #include <string>
 #include <vector>
 
+#include <unordered_map>
+
 #include "audio_classes.h"
+#include "third_party/steamaudio/phonon.h"  // Steam Audio 4.8.1 (Apache-2.0); phonon.dll is loaded at run time
+#include "audio_sigs.inc"
 
 namespace {
 
-constexpr const char* kVersion = "0.6.2";
+constexpr const char* kVersion = "0.9.6";
 constexpr DWORD kStamp128 = 0x6aa08454;  // TS4_x64.exe 1.128.90.1030 (DX11)
 
 // ---------------------------------------------------------------------------
@@ -122,9 +126,24 @@ Value g_values[] = {
     {"menu_key", 0xBE, {0xBE}},  // virtual-key code of the menu hotkey without Sims4VR (0xBE = "."; 0 = none)
     {"clarity", 1, {1}},             // 1: lift the game's muffling of ordinary sounds (0.4.0)
     {"clarity_floor", 3000, {3000}},  // Hz: the lowest a sound's low-pass may go (500 .. 20000)
+    {"pan_log", 1, {1}},              // 1: log what the 3D panner is given (HRTF groundwork, changes no sound)
+    {"hrtf", 1, {1}},                 // 1: own binaural 3D sound for positional sounds (needs the game's output set to Stereo)
+    {"hrtf_sa", 1, {1}},              // 1: Steam Audio's HRTF (phonon.dll next to the mod) instead of the built-in head model
+    {"hrtf_strength", 1, {1}},        // 0 .. 1: how much of the binaural effect (0 = none, the game's sound)
+    {"hrtf_rear", 1, {1}},            // 0 .. 1.5: how strongly sounds behind you are dulled
+    {"hrtf_stereo", 1, {1}},          // 1: also make stereo sources (music, radios, TV) binaural, from their left+right mix
+    {"hrtf_mirror", 0, {0}},          // 1: mirror left and right (new key: 0.9.0 saved hrtf_flip = 1 for the then-wrong direction)
+    {"muffle", 1, {1}},               // 1: sounds heard through walls, floors and closed doors are muffled
+    {"muffle_amount", 1, {1}},        // 0 .. 1: how strong the muffling is
+    {"muffle_treble", 400, {400}},    // Hz: how dull a fully blocked sound gets (200 .. 4000)
+    {"muffle_loss", 0.6f, {0.6f}},    // 0 .. 1: how much quieter a fully blocked sound gets
+    {"reverb", 1, {1}},               // 1: room reverb on every positioned sound
+    {"reverb_amount", 0.25f, {0.25f}},// 0 .. 1: how much reverb is mixed in
+    {"reverb_size", 0.5f, {0.5f}},    // 0 .. 1: small furnished room .. big empty hall (used when the VR mod gives no room)
+    {"reverb_damp", 0.5f, {0.5f}},    // 0 .. 1: soft furnishings soak up treble in the tail
 };
 enum { kProbe, kProbeOnLoad, kBoost, kMusicBoost, kEffectsBoost, kVoicesBoost, kUiBoost, kMenuMusicBoost,
-       kAmbientBoost, kAmbientBus, kMenuKey, kClarity, kClarityFloor, kValues };
+       kAmbientBoost, kAmbientBus, kMenuKey, kClarity, kClarityFloor, kPanLog, kHrtf, kHrtfSA, kHrtfStrength, kHrtfRear, kHrtfStereo, kHrtfFlip, kMuffle, kMuffleAmount, kMuffleTreble, kMuffleLoss, kReverb, kReverbAmount, kReverbSize, kReverbDamp, kValues };
 static_assert(sizeof(g_values) / sizeof(g_values[0]) == kValues, "g_values and its enum differ");
 float val(int i) { return g_values[i].v.load(std::memory_order_relaxed); }
 
@@ -214,6 +233,12 @@ bool setValue(const char* key, float f) {
         f = std::min(4.0f, std::max(1.0f, std::round(f)));
         g_muteUntil = GetTickCount64() + 4000;  // let the player hear which sounds drop out
     }
+    if (v == &g_values[kPanLog] || v == &g_values[kHrtf] || v == &g_values[kHrtfSA] || v == &g_values[kHrtfStereo] || v == &g_values[kHrtfFlip] || v == &g_values[kReverb] || v == &g_values[kMuffle]) f = f != 0 ? 1.0f : 0.0f;
+    if (v == &g_values[kMuffleAmount] || v == &g_values[kMuffleLoss]) f = std::min(1.0f, std::max(0.0f, f));
+    if (v == &g_values[kMuffleTreble]) f = std::min(4000.0f, std::max(200.0f, f));
+    if (v == &g_values[kReverbAmount] || v == &g_values[kReverbSize] || v == &g_values[kReverbDamp]) f = std::min(1.0f, std::max(0.0f, f));
+    if (v == &g_values[kHrtfStrength]) f = std::min(1.0f, std::max(0.0f, f));
+    if (v == &g_values[kHrtfRear]) f = std::min(1.5f, std::max(0.0f, f));
     if (v == &g_values[kClarityFloor]) f = std::min(20000.0f, std::max(500.0f, f));
     if (v->v.exchange(f) != f) {
         LOG("Set %s = %g", v->key, f);
@@ -225,9 +250,188 @@ bool setValue(const char* key, float f) {
 // ---------------------------------------------------------------------------
 // The game
 
+constexpr int kClassCount = static_cast<int>(sizeof(kAudioClasses128) / sizeof(kAudioClasses128[0]));
 uint8_t* g_exe = nullptr;
 size_t g_exeSize = 0;
 bool g_known = false;  // the exe is the build the vtable table is for
+
+uint32_t g_vtRva[kClassCount];  // vtable rva per class in THIS build (0 = not found)
+uint32_t g_lowPassSlot = 0, g_lowPassFn = 0, g_shelfSlot = 0, g_shelfFn = 0;  // rvas in this build
+uint32_t g_panSlot = 0, g_panFn = 0;  // Pan2D1 process function and its descriptor slot
+
+// --- Another build (1.129 and later): rvas by signature. The 1.129 exe is encrypted on disk, but its
+// image in memory is plain, so everything is found in memory: a constructor of each class by its masked
+// signature (src/audio_sigs.inc, made from 1.128 by tools/gen_audio_sigs.py), the vtable from the lea
+// inside it, and the filter process slots in .data as the qword that holds the process function.
+
+struct Pat {
+    std::vector<uint8_t> bytes, mask;
+};
+Pat parsePat(const char* sig) {
+    Pat p;
+    for (const char* c = sig; *c;) {
+        while (*c == ' ') ++c;
+        if (!*c) break;
+        if (c[0] == '?') {
+            p.bytes.push_back(0);
+            p.mask.push_back(0);
+            c += 2;
+        } else {
+            p.bytes.push_back(static_cast<uint8_t>(std::strtoul(std::string(c, 2).c_str(), nullptr, 16)));
+            p.mask.push_back(1);
+            c += 2;
+        }
+    }
+    return p;
+}
+
+struct Region {
+    const uint8_t* at;
+    size_t size;
+};
+// Committed, readable regions of the exe section called `name`.
+std::vector<Region> sectionRegions(const char* name) {
+    std::vector<Region> out;
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(g_exe);
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(g_exe + dos->e_lfanew);
+    auto* sec = IMAGE_FIRST_SECTION(nt);
+    for (int i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+        if (std::strncmp(reinterpret_cast<const char*>(sec[i].Name), name, 8) != 0) continue;
+        uint8_t* lo = g_exe + sec[i].VirtualAddress;
+        uint8_t* hi = lo + std::max(sec[i].Misc.VirtualSize, sec[i].SizeOfRawData);
+        for (uint8_t* p = lo; p < hi;) {
+            MEMORY_BASIC_INFORMATION mbi;
+            if (!VirtualQuery(p, &mbi, sizeof(mbi))) break;
+            uint8_t* end = std::min(hi, static_cast<uint8_t*>(mbi.BaseAddress) + mbi.RegionSize);
+            bool ok = mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD));
+            if (ok) out.push_back({p, static_cast<size_t>(end - p)});
+            p = end;
+        }
+    }
+    return out;
+}
+
+// Matches (first two) of every pattern in .text, in one pass: patterns are bucketed by their first 4 bytes.
+std::vector<std::vector<const uint8_t*>> scanPatterns(const std::vector<Pat>& pats) {
+    std::vector<std::vector<const uint8_t*>> hits(pats.size());
+    std::unordered_multimap<uint32_t, int> byKey;
+    for (size_t i = 0; i < pats.size(); ++i) {
+        if (pats[i].bytes.size() < 8 || !pats[i].mask[0] || !pats[i].mask[1] || !pats[i].mask[2] || !pats[i].mask[3]) continue;
+        uint32_t k;
+        std::memcpy(&k, pats[i].bytes.data(), 4);
+        byKey.emplace(k, static_cast<int>(i));
+    }
+    for (const Region& r : sectionRegions(".text")) {
+        for (size_t o = 0; o + 4 <= r.size; ++o) {
+            uint32_t k;
+            std::memcpy(&k, r.at + o, 4);
+            auto range = byKey.equal_range(k);
+            for (auto it = range.first; it != range.second; ++it) {
+                const Pat& p = pats[it->second];
+                if (o + p.bytes.size() > r.size || hits[it->second].size() >= 2) continue;
+                bool ok = true;
+                for (size_t j = 4; j < p.bytes.size() && ok; ++j)
+                    if (p.mask[j] && r.at[o + j] != p.bytes[j]) ok = false;
+                if (ok) hits[it->second].push_back(r.at + o);
+            }
+        }
+    }
+    return hits;
+}
+
+bool inSection(const char* name, const void* p) {
+    for (const Region& r : sectionRegions(name))
+        if (p >= r.at && p < r.at + r.size) return true;
+    return false;
+}
+
+// The qword equal to `value` in .data (exactly one), as an rva; 0 = none or several.
+uint32_t dataSlotHolding(uint64_t value) {
+    uint32_t found = 0;
+    int n = 0;
+    for (const Region& r : sectionRegions(".data")) {
+        for (size_t o = 0; o + 8 <= r.size; o += 8) {
+            uint64_t q;
+            std::memcpy(&q, r.at + o, 8);
+            if (q == value) {
+                found = static_cast<uint32_t>(r.at + o - g_exe);
+                ++n;
+            }
+        }
+    }
+    return n == 1 ? found : 0;
+}
+
+bool resolveByScan() {
+    const int nCls = static_cast<int>(sizeof(kAudioSigs) / sizeof(kAudioSigs[0]));
+    const int nProc = static_cast<int>(sizeof(kProcSigs) / sizeof(kProcSigs[0]));
+    std::vector<Pat> pats;
+    for (int i = 0; i < nCls; ++i) pats.push_back(parsePat(kAudioSigs[i].sig));
+    for (int i = 0; i < nProc; ++i) pats.push_back(parsePat(kProcSigs[i].sig));
+    ULONGLONG t0 = GetTickCount64();
+    auto hits = scanPatterns(pats);
+    int resolved = 0;
+    for (int i = 0; i < nCls; ++i) {
+        const AudioSig& a = kAudioSigs[i];
+        int cls = -1;
+        for (int c = 0; c < kClassCount; ++c)
+            if (!std::strcmp(kAudioClasses128[c].name, a.name)) cls = c;
+        if (cls < 0) continue;
+        if (hits[i].size() != 1) {
+            LOG("Build scan: %s constructor %s", a.name, hits[i].empty() ? "not found" : "signature not unique");
+            continue;
+        }
+        const uint8_t* fn = hits[i][0];
+        if ((fn[a.dispOff - 3] != 0x48 && fn[a.dispOff - 3] != 0x4c) || fn[a.dispOff - 2] != 0x8d) {
+            LOG("Build scan: %s constructor has no lea where expected", a.name);
+            continue;
+        }
+        int32_t disp;
+        std::memcpy(&disp, fn + a.dispOff, 4);
+        const uint8_t* vt = fn + a.endOff + disp;
+        uint64_t slot0 = 0;
+        std::memcpy(&slot0, vt, 8);
+        if (!inSection(".rdata", vt) || !inSection(".text", reinterpret_cast<void*>(slot0))) {
+            LOG("Build scan: %s vtable 0x%llx fails the sanity check", a.name, static_cast<unsigned long long>(vt - g_exe));
+            continue;
+        }
+        g_vtRva[cls] = static_cast<uint32_t>(vt - g_exe);
+        ++resolved;
+        LOG("Build scan: %s vtable 0x%x (1.128: 0x%x, shift %+lld)", a.name, g_vtRva[cls], a.vtable128,
+            static_cast<long long>(static_cast<int64_t>(g_vtRva[cls]) - static_cast<int64_t>(a.vtable128)));
+    }
+    int procs = 0;
+    for (int i = 0; i < nProc; ++i) {
+        const ProcSig& p = kProcSigs[i];
+        auto& h = hits[nCls + i];
+        if (h.size() != 1) {
+            LOG("Build scan: %s process function %s", p.name, h.empty() ? "not found" : "signature not unique");
+            continue;
+        }
+        uint32_t fnRva = static_cast<uint32_t>(h[0] - g_exe);
+        uint32_t slot = dataSlotHolding(reinterpret_cast<uint64_t>(h[0]));
+        if (!slot) {
+            LOG("Build scan: %s process function 0x%x is not held by exactly one .data slot", p.name, fnRva);
+            continue;
+        }
+        LOG("Build scan: %s process 0x%x in slot 0x%x (1.128: 0x%x / 0x%x)", p.name, fnRva, slot, p.fn128, p.slot128);
+        if (!std::strcmp(p.name, "LowPassIir2")) g_lowPassFn = fnRva, g_lowPassSlot = slot;
+        else if (!std::strcmp(p.name, "Pan2D1")) g_panFn = fnRva, g_panSlot = slot;
+        else g_shelfFn = fnRva, g_shelfSlot = slot;
+        ++procs;
+    }
+    LOG("Build scan: %d of %d classes, %d of %d process slots, %llu ms", resolved, nCls, procs, nProc,
+        static_cast<unsigned long long>(GetTickCount64() - t0));
+    return resolved > 0;
+}
+
+// The classes the mixer and Clarity cannot work without.
+bool coreResolved() {
+    for (const char* n : {"SubMix", "Send", "Dac", "GainFader", "HighPassIir2"})
+        for (int c = 0; c < kClassCount; ++c)
+            if (!std::strcmp(kAudioClasses128[c].name, n) && !g_vtRva[c]) return false;
+    return true;
+}
 
 bool checkExe() {
     g_exe = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
@@ -235,9 +439,18 @@ bool checkExe() {
     auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(g_exe + dos->e_lfanew);
     g_exeSize = nt->OptionalHeader.SizeOfImage;
     DWORD stamp = nt->FileHeader.TimeDateStamp;
-    g_known = stamp == kStamp128;
-    LOG("Game exe stamp 0x%08lx: %s", static_cast<unsigned long>(stamp),
-        g_known ? "1.128.90.1030, known" : "unknown build: the mod stays off (needs an update for this patch)");
+    if (stamp == kStamp128) {
+        for (int c = 0; c < kClassCount; ++c) g_vtRva[c] = kAudioClasses128[c].vtable;
+        g_lowPassSlot = 0x2859b30, g_lowPassFn = 0x1aef230, g_shelfSlot = 0x2859660, g_shelfFn = 0x1aee640;
+        g_panSlot = 0x285ad20, g_panFn = 0x1af0220;
+        g_known = true;
+        LOG("Game exe stamp 0x%08lx: 1.128.90.1030, table addresses", static_cast<unsigned long>(stamp));
+        return true;
+    }
+    LOG("Game exe stamp 0x%08lx is not 1.128: looking for the audio classes by signature in memory",
+        static_cast<unsigned long>(stamp));
+    g_known = resolveByScan() && coreResolved();
+    LOG(g_known ? "Found the audio classes by signature: the mod is on" : "The audio classes were not all found: the mod stays off");
     return g_known;
 }
 
@@ -247,24 +460,26 @@ bool checkExe() {
 // Memory is read with ReadProcessMemory, so a page freed meanwhile only fails
 // the read instead of crashing the game.
 
-constexpr int kClassCount = static_cast<int>(sizeof(kAudioClasses128) / sizeof(kAudioClasses128[0]));
 struct VtableOf {
     uint64_t address;
     int cls;
 };
-VtableOf g_vtables[kClassCount];  // sorted by address; in the DLL image, not the heap the probe scans
+VtableOf g_vtables[kClassCount];
+int g_vtCount = 0;  // sorted by address; in the DLL image, not the heap the probe scans
 uint64_t g_vtMin = 0, g_vtMax = 0;
 
 void buildVtables() {
-    for (int i = 0; i < kClassCount; ++i) g_vtables[i] = {reinterpret_cast<uint64_t>(g_exe) + kAudioClasses128[i].vtable, i};
-    std::sort(g_vtables, g_vtables + kClassCount, [](const VtableOf& a, const VtableOf& b) { return a.address < b.address; });
+    g_vtCount = 0;
+    for (int i = 0; i < kClassCount; ++i)
+        if (g_vtRva[i]) g_vtables[g_vtCount++] = {reinterpret_cast<uint64_t>(g_exe) + g_vtRva[i], i};
+    std::sort(g_vtables, g_vtables + g_vtCount, [](const VtableOf& a, const VtableOf& b) { return a.address < b.address; });
     g_vtMin = g_vtables[0].address;
-    g_vtMax = g_vtables[kClassCount - 1].address;
+    g_vtMax = g_vtables[g_vtCount - 1].address;
 }
 
 int classOfVtable(uint64_t q) {
     if (q < g_vtMin || q > g_vtMax) return -1;
-    int lo = 0, hi = kClassCount - 1;
+    int lo = 0, hi = g_vtCount - 1;
     while (lo <= hi) {
         int mid = (lo + hi) / 2;
         if (g_vtables[mid].address == q) return g_vtables[mid].cls;
@@ -466,7 +681,7 @@ float readF(uint64_t address) {
     float f = -1;
     return readMemory(address, &f, 4) ? f : -1;
 }
-uint64_t vtableOf(int cls) { return reinterpret_cast<uint64_t>(g_exe) + kAudioClasses128[cls].vtable; }
+uint64_t vtableOf(int cls) { return reinterpret_cast<uint64_t>(g_exe) + g_vtRva[cls]; }
 
 constexpr size_t kOwner = 0x20, kChannels = 0x58, kParams = 0x60, kSendTarget = 0x78;
 constexpr uint32_t kFloatTag = 0x7ff7fff1;  // above a float parameter
@@ -730,8 +945,6 @@ void startMixer() {
 //   HighShelfIir2 descriptor 0x2859560 -> table 0x2859658, slot 1 = 0x1aee640
 //     (freq +0x60, gain +0x68; gain 1 = bypass).
 
-constexpr uint32_t kLowPassSlot = 0x2859b30, kLowPassProcess = 0x1aef230;
-constexpr uint32_t kShelfSlot = 0x2859660, kShelfProcess = 0x1aee640;
 constexpr size_t kHighPassAfterLowPass = 0x110;  // a sound's HighPassIir2 follows its LowPassIir2
 constexpr float kBandLimited = 150;               // high-pass above this: a deliberate speaker effect, left alone
 constexpr float kGameLowest = 500, kOpen = 20000;  // the game's muffling range (Hz)
@@ -746,7 +959,8 @@ std::atomic<uint32_t> g_lowPassCalls{0}, g_lowPassLifted{0}, g_shelfOpened{0};
 // muffling above the knee stays the game's.
 float clearCutoff(float game, float floor) {
     float knee = std::min(kOpen, std::max(6000.0f, floor * 2));
-    if (!(game > 1) || game >= knee || floor <= kGameLowest || floor >= knee) return game;
+    if (!(game > 1) || game >= knee || floor <= kGameLowest) return game;
+    if (floor >= knee) return std::max(game, floor);  // floor at the top of the range: muffling fully off
     float t = std::log(std::max(game, kGameLowest) / kGameLowest) / std::log(knee / kGameLowest);
     return std::max(game, floor * std::pow(knee / floor, t));
 }
@@ -795,10 +1009,13 @@ bool swapSlot(uint32_t slot, uint32_t expected, void* ours, ProcessFn& original)
 
 void startClarity() {
     int hp = classIndex("HighPassIir2");
-    if (hp < 0) return;
+    if (hp < 0 || !g_vtRva[hp] || !g_lowPassSlot || !g_shelfSlot) {
+        LOG("Clarity: slots or classes not found in this build; off");
+        return;
+    }
     g_vtHighPass = vtableOf(hp);
-    bool lp = swapSlot(kLowPassSlot, kLowPassProcess, reinterpret_cast<void*>(&lowPassProcess), g_lowPassProcess);
-    bool shelf = swapSlot(kShelfSlot, kShelfProcess, reinterpret_cast<void*>(&shelfProcess), g_shelfProcess);
+    bool lp = swapSlot(g_lowPassSlot, g_lowPassFn, reinterpret_cast<void*>(&lowPassProcess), g_lowPassProcess);
+    bool shelf = swapSlot(g_shelfSlot, g_shelfFn, reinterpret_cast<void*>(&shelfProcess), g_shelfProcess);
     LOG("Clarity: %s, muffling kept at %.0f Hz or above (scaled, speaker effects left alone); low-pass %s, treble "
         "shelf %s", val(kClarity) != 0 ? "on" : "off", val(kClarityFloor), lp ? "ready" : "NOT ready",
         shelf ? "ready" : "NOT ready");
@@ -814,6 +1031,575 @@ void startClarity() {
                 LOG("Clarity: %s at %.0f Hz; in 10 s: %u low-pass runs, %u made clearer, %u treble cuts opened",
                     lastOn != 0 ? "on" : "off", lastFloor, calls, lifted, opened);
             }
+        }
+    }, nullptr, 0, nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// 3D panner probe (0.8.0, HRTF groundwork): the engine's Pan2D1 process function (descriptor slot, found like the
+// filters') is wrapped. It changes nothing: it counts calls and, a few times a second, copies what one call was
+// given (the panner's angle/distance parameters at +0x60/+0x68/+0x70, output and input channel counts at
+// +0x324/+0x328, the voice context's input buffer at ctx+0xc490: data pointer at +8, channel stride (ushort) at
+// +0x12) into a small ring that a logger thread writes out. The context swaps its two buffers (ctx+0xc490 /
+// +0xc498) after the call, so an HRTF renderer would read the mono input before the call and write the stereo
+// output after it. Read with ReadProcessMemory, never dereferenced on the audio thread.
+
+using PanFn = uint64_t (*)(uint8_t* plugin, void* context, char flag);
+ProcessFn g_panProcess = nullptr;  // the game's own function (called as a PanFn)
+std::atomic<uint32_t> g_panCalls{0};
+constexpr size_t kPanRing = 48;
+struct PanSample {
+    uint64_t panner = 0;
+    uint32_t in = 0, out = 0, stride = 0, flag = 0;
+    float angle = 0, distance = 0, third = 0, peak = 0;
+};
+PanSample g_panRing[kPanRing];
+std::atomic<uint32_t> g_panTaken{0};
+std::atomic<ULONGLONG> g_panNext{0};
+
+void samplePanner(uint8_t* p, uint8_t* ctx, char flag) {
+    uint32_t slot = g_panTaken.load(std::memory_order_relaxed);
+    if (slot >= kPanRing) return;
+    PanSample s;
+    s.panner = reinterpret_cast<uint64_t>(p);
+    s.flag = static_cast<uint32_t>(static_cast<uint8_t>(flag));
+    float f[3] = {};
+    uint32_t ch[2] = {};
+    readMemory(reinterpret_cast<uint64_t>(p + 0x60), &f[0], 4);
+    readMemory(reinterpret_cast<uint64_t>(p + 0x68), &f[1], 4);
+    readMemory(reinterpret_cast<uint64_t>(p + 0x70), &f[2], 4);
+    readMemory(reinterpret_cast<uint64_t>(p + 0x324), &ch[0], 8);  // in, out
+    s.angle = f[0], s.distance = f[1], s.third = f[2], s.in = ch[0], s.out = ch[1];  // +0x324 input, +0x328 output channels
+    uint64_t buf = readQ(reinterpret_cast<uint64_t>(ctx + 0xc490));
+    if (buf) {
+        uint64_t data = readQ(buf + 8);
+        uint16_t stride = 0;
+        readMemory(buf + 0x12, &stride, 2);
+        s.stride = stride;
+        float block[256];
+        if (data && readMemory(data, block, sizeof(block))) {
+            float peak = 0;
+            for (float x : block) peak = std::max(peak, std::fabs(x));
+            s.peak = peak;
+        }
+    }
+    g_panRing[slot] = s;
+    g_panTaken.store(slot + 1, std::memory_order_release);
+}
+
+// --- Binaural 3D sound (0.8.0). A positional sound's Pan2D1 gets its direction as an angle (+0x60, degrees,
+// 0 = ahead, growing towards the listener's first axis = right) and a "directness" (+0x68: distance across the
+// listener's plane, capped at the sound's near radius; under 1 the game spreads the sound towards the middle,
+// 0 = middle of the head). With the game's output set to Stereo (2 output channels) and a mono source, the
+// engine's own pan result is replaced by a head model: interaural time difference (Woodworth, fractional
+// delay), head shadow (far ear lower and duller), and a dulling of sounds behind you (the ear's shadow:
+// front/back). Height is not known to the panner (its third parameter is 0): the VR mod's pan step would
+// have to pass it. Blocks are 256 samples, planar, channel stride = ushort at buffer+0x12; the input buffer
+// is ctx+0xc490 and the output ctx+0xc498 before the call (swapped after it).
+
+constexpr int kHrtfVoices = 256, kBlock = 256, kHist = 64;
+
+// --- Steam Audio (phonon.dll, Apache-2.0, loaded from the mod folder; a missing or failing DLL leaves the built-in
+// head model below in charge). One binaural effect per voice slot, all made on a worker thread at start.
+// Directions are in the listener's frame: +x right, +y up, -z ahead (Steam Audio's own convention, and the
+// game's: the pan angle is atan2(x, -z)). A hrtf.sofa file in the mod folder is loaded instead of the built-in HRTF.
+struct SteamAudio {
+    decltype(&iplContextCreate) contextCreate = nullptr;
+    decltype(&iplHRTFCreate) hrtfCreate = nullptr;
+    decltype(&iplBinauralEffectCreate) effectCreate = nullptr;
+    decltype(&iplBinauralEffectApply) effectApply = nullptr;
+    decltype(&iplBinauralEffectReset) effectReset = nullptr;
+    IPLContext context = nullptr;
+    IPLHRTF hrtf = nullptr;
+    IPLAudioSettings audio{48000, kBlock};
+};
+SteamAudio g_sa;
+std::atomic<bool> g_saReady{false};
+
+struct HrtfVoice {
+    std::atomic<uint64_t> key{0};
+    std::atomic<IPLBinauralEffect> fx{nullptr};
+    uint32_t last = 0;
+    bool fresh = true;
+    float hist[kHist] = {};
+    struct Reverb* rev = nullptr;  // made when the voice first gets reverb
+    float lpL = 0, lpR = 0, elvLp = 0, occLp = 0, occG = 1;  // occ*: the muffle state  // elvLp: the height cue's low-pass state
+    float gL = 1, gR = 1, dL = 0, dR = 0, aL = 1, aR = 1;  // the values at the end of the last block
+};
+HrtfVoice g_hrtf[kHrtfVoices];
+
+// Room reverb: a small Schroeder reverb per voice (4 combs with a damping low-pass, then an all-pass per ear), so
+// every positioned sound gets a tail without a shared bus. The comb lengths follow the room size when the voice
+// starts. The VR mod can give the real room through esc_set_room (volume in m3, absorption 0..1); the menu's size and
+// damping apply when it hasn't for 2 s.
+constexpr int kCombBase[4] = {1116, 1188, 1277, 1356}, kApBase[2] = {556, 441}, kRevMax = 3 * 1400;
+struct Reverb {
+    float comb[4][kRevMax] = {};
+    float ap[2][2][1200] = {};
+    int clen[4] = {1116, 1188, 1277, 1356}, cpos[4] = {}, apos[2] = {};
+    float damp[4] = {};
+};
+std::atomic<float> g_roomVolume{0}, g_roomAbsorb{0};
+std::atomic<uint32_t> g_roomTick{0};
+std::atomic<float> g_pyRoomVolume{0}, g_pyRoomAbsorb{0};  // the script's own estimate (used when the VR mod gives none)
+std::atomic<uint32_t> g_pyRoomTick{0};
+
+void roomParams(float& size01, float& damp01) {
+    size01 = val(kReverbSize), damp01 = val(kReverbDamp);
+    // The VR mod's room (esc_set_room) wins, then this mod's own script estimate, then the menu.
+    const uint32_t now = GetTickCount();
+    float vol = 0, ab = 0;
+    if (g_roomVolume.load(std::memory_order_relaxed) > 0 && now - g_roomTick.load(std::memory_order_relaxed) < 2000)
+        vol = g_roomVolume.load(std::memory_order_relaxed), ab = g_roomAbsorb.load(std::memory_order_relaxed);
+    else if (g_pyRoomVolume.load(std::memory_order_relaxed) > 0 && now - g_pyRoomTick.load(std::memory_order_relaxed) < 5000)
+        vol = g_pyRoomVolume.load(std::memory_order_relaxed), ab = g_pyRoomAbsorb.load(std::memory_order_relaxed);
+    if (vol > 0) {
+        size01 = std::min(1.0f, std::max(0.0f, (std::cbrt(vol) - 1.5f) / 8.0f));
+        damp01 = std::min(1.0f, std::max(0.0f, ab));
+    }
+}
+
+void startReverb(HrtfVoice& v) {
+    if (!v.rev) v.rev = new Reverb();
+    else *v.rev = Reverb();
+    float size01, damp01;
+    roomParams(size01, damp01);
+    float scale = 0.45f + 1.55f * size01;  // 0.45 .. 2.0 of the base lengths
+    for (int i = 0; i < 4; ++i) v.rev->clen[i] = std::min(kRevMax, std::max(64, static_cast<int>(kCombBase[i] * scale)));
+}
+
+// Adds the tail of `in` to left/right (already binaural).
+void addReverb(HrtfVoice& v, const float* in, float* left, float* right, float directness) {
+    if (!v.rev) startReverb(v);
+    Reverb& r = *v.rev;
+    float size01, damp01;
+    roomParams(size01, damp01);
+    float fb = 0.70f + 0.27f * size01, d = 0.1f + 0.8f * damp01;
+    // farther sounds carry more reverb relative to the direct sound
+    float wet = val(kReverbAmount) * 0.35f * (1.0f + 0.8f * (1.0f - std::min(1.0f, std::max(0.0f, directness))));
+    for (int n = 0; n < kBlock; ++n) {
+        float x = in[n] * 0.05f, c[4];
+        for (int i = 0; i < 4; ++i) {
+            float y = r.comb[i][r.cpos[i]];
+            r.damp[i] = y * (1.0f - d) + r.damp[i] * d;
+            r.comb[i][r.cpos[i]] = x + r.damp[i] * fb;
+            if (++r.cpos[i] >= r.clen[i]) r.cpos[i] = 0;
+            c[i] = y;
+        }
+        float w[2] = {c[0] - c[1] + c[2] - c[3], c[0] + c[1] - c[2] - c[3]};
+        for (int ch = 0; ch < 2; ++ch) {
+            float* b = r.ap[ch][0];
+            int len = kApBase[0], p = r.apos[0];
+            float z = b[p], o = -w[ch] + z;
+            b[p] = w[ch] + z * 0.5f;
+            if (++p >= len) p = 0;
+            if (ch == 1) r.apos[0] = p;
+            w[ch] = o;
+        }
+        left[n] += w[0] * wet * 4.0f;
+        right[n] += w[1] * wet * 4.0f;
+    }
+}
+std::atomic<uint32_t> g_hrtfBlockCount{0}, g_hrtfRendered{0}, g_hrtfSkipped{0}, g_hrtfLastOut{0}, g_hrtfLastIn{0},
+    g_hrtfSteam{0};
+
+void resetVoice(HrtfVoice& v) {
+    if (IPLBinauralEffect fx = v.fx.load()) g_sa.effectReset(fx);
+    v.fresh = true;
+    std::memset(v.hist, 0, sizeof(v.hist));
+    v.lpL = v.lpR = v.elvLp = v.occLp = 0, v.occG = 1;
+    if (v.rev) { delete v.rev; v.rev = nullptr; }
+}
+
+HrtfVoice* voiceFor(uint64_t key) {
+    uint32_t h = static_cast<uint32_t>((key >> 4) * 2654435761u);
+    HrtfVoice* oldest = nullptr;
+    for (int i = 0; i < 8; ++i) {
+        HrtfVoice& v = g_hrtf[(h + i) % kHrtfVoices];
+        uint64_t k = v.key.load(std::memory_order_relaxed);
+        if (k == key) return &v;
+        uint64_t zero = 0;
+        if (k == 0 && v.key.compare_exchange_strong(zero, key)) {
+            resetVoice(v);
+            return &v;
+        }
+        if (!oldest || v.last < oldest->last) oldest = &v;
+    }
+    oldest->key.store(key);  // the table is crowded here: the voice unused the longest gives way
+    resetVoice(*oldest);
+    return oldest;
+}
+
+float onePole(float cutoff, float fs) { return cutoff >= 18000.0f ? 1.0f : 1.0f - std::exp(-6.2831853f * cutoff / fs); }
+
+// in: 256 mono samples; out: 256 left + 256 right samples (separate arrays).
+void renderBinaural(HrtfVoice& v, const float* in, float* left, float* right, float angleDeg, float elevDeg, float directness) {
+    constexpr float kFs = 48000.0f, kHeadRadius = 0.0875f, kSpeed = 343.0f, kBase = 0.75f;
+    float th = angleDeg * 0.017453292f;  // the game's angle grows towards the right (tested in game 2026-11-04)
+    if (val(kHrtfFlip) != 0) th = -th;
+    float s = std::min(1.0f, std::max(0.0f, directness)) * val(kHrtfStrength);
+    float sinT = std::sin(th), cosT = std::cos(th);
+    float lat = sinT * s;  // + = the sound is on the right
+    float aLat = std::fabs(lat);
+    float rear = std::max(0.0f, -cosT) * s * val(kHrtfRear);
+    float phi = std::fabs(std::asin(std::min(1.0f, std::max(-1.0f, sinT))));
+    float itd = (kHeadRadius / kSpeed) * (phi + std::sin(phi)) * kFs * s;  // samples, at most ~32
+    float dL = lat > 0 ? itd : 0, dR = lat < 0 ? itd : 0;
+    float nearGain = std::pow(10.0f, 1.5f * aLat / 20.0f), farGain = std::pow(10.0f, -5.0f * aLat / 20.0f);
+    float rearGain = std::pow(10.0f, -2.0f * rear / 20.0f);
+    float gL = kBase * rearGain * (lat > 0 ? farGain : nearGain), gR = kBase * rearGain * (lat > 0 ? nearGain : farGain);
+    float farCut = std::exp(std::log(20000.0f) + (std::log(2000.0f) - std::log(20000.0f)) * aLat);
+    float rearCut = std::exp(std::log(20000.0f) + (std::log(4500.0f) - std::log(20000.0f)) * std::min(1.0f, rear));
+    float cL = std::min(lat > 0 ? farCut : 20000.0f, rearCut), cR = std::min(lat > 0 ? 20000.0f : farCut, rearCut);
+    float aL = onePole(cL, kFs), aR = onePole(cR, kFs);
+    if (v.fresh) {
+        v.gL = gL, v.gR = gR, v.dL = dL, v.dR = dR, v.aL = aL, v.aR = aR;
+        v.fresh = false;
+    }
+    // Height without a measured HRTF: a sound above you gains treble, one below you loses it (the main spectral cue
+    // the ear has for elevation), the more the further up or down it is.
+    float fin[kBlock];
+    {
+        const float se = std::sin(elevDeg * 0.017453292f);
+        const float k = (se > 0 ? 0.9f * se : 0.6f * se) * s;
+        const float a = onePole(5000.0f, kFs);
+        float lp = v.elvLp;
+        for (int n = 0; n < kBlock; ++n) {
+            lp += a * (in[n] - lp);
+            fin[n] = in[n] + k * (in[n] - lp);
+        }
+        v.elvLp = std::isfinite(lp) ? lp : 0.0f;
+    }
+    float ext[kHist + kBlock + 1];
+    std::memcpy(ext, v.hist, sizeof(v.hist));
+    std::memcpy(ext + kHist, fin, kBlock * sizeof(float));
+    ext[kHist + kBlock] = 0;
+    auto tap = [&](int n, float d) {
+        float pos = static_cast<float>(kHist + n) - d;
+        int i0 = static_cast<int>(pos);
+        float fr = pos - static_cast<float>(i0);
+        return fr > 0 ? ext[i0] + (ext[i0 + 1] - ext[i0]) * fr : ext[i0];
+    };
+    float lpL = v.lpL, lpR = v.lpR;
+    for (int n = 0; n < kBlock; ++n) {
+        float t = static_cast<float>(n + 1) / kBlock;
+        float xl = tap(n, v.dL + (dL - v.dL) * t), xr = tap(n, v.dR + (dR - v.dR) * t);
+        lpL += (v.aL + (aL - v.aL) * t) * (xl - lpL);
+        lpR += (v.aR + (aR - v.aR) * t) * (xr - lpR);
+        float l = lpL * (v.gL + (gL - v.gL) * t), r = lpR * (v.gR + (gR - v.gR) * t);
+        left[n] = std::isfinite(l) ? l : 0.0f;
+        right[n] = std::isfinite(r) ? r : 0.0f;
+    }
+    v.lpL = std::isfinite(lpL) ? lpL : 0.0f;
+    v.lpR = std::isfinite(lpR) ? lpR : 0.0f;
+    std::memcpy(v.hist, ext + kBlock, sizeof(v.hist));
+    v.gL = gL, v.gR = gR, v.dL = dL, v.dR = dR, v.aL = aL, v.aR = aR;
+    v.last = g_hrtfBlockCount.fetch_add(1, std::memory_order_relaxed);
+}
+
+// Height: the panner only knows a horizontal angle. The VR mod's pan step (it sees the sound's position and the
+// listener's frame) tells us each panner's elevation in degrees through esc_set_elevation (+ up, - down); a value
+// not refreshed for 2 s is taken as 0 (level with you).
+struct ElevSlot {
+    std::atomic<uint64_t> key{0};
+    std::atomic<float> degrees{0};
+    std::atomic<uint32_t> tick{0};
+    std::atomic<float> occl{0};       // 0 clear .. 1 fully behind walls
+    std::atomic<uint32_t> occlTick{0};
+};
+constexpr int kElevSlots = 512;
+ElevSlot g_elev[kElevSlots];
+std::atomic<uint32_t> g_elevUpdates{0};
+std::atomic<float> g_elevLast{0};
+std::atomic<uint32_t> g_skipIn{0}, g_skipOut{0};
+
+ElevSlot* slotFor(uint64_t key);
+void setOcclusion(const void* panner, float amount) {
+    if (!panner || !std::isfinite(amount)) return;
+    ElevSlot* s = slotFor(reinterpret_cast<uint64_t>(panner));
+    s->occl.store(std::min(1.0f, std::max(0.0f, amount)), std::memory_order_relaxed);
+    s->occlTick.store(GetTickCount(), std::memory_order_relaxed);
+}
+
+ElevSlot* slotFor(uint64_t key) {
+    uint32_t h = static_cast<uint32_t>((key >> 4) * 2654435761u);
+    ElevSlot* use = &g_elev[h % kElevSlots];
+    for (int i = 0; i < 8; ++i) {
+        ElevSlot& s = g_elev[(h + i) % kElevSlots];
+        uint64_t k = s.key.load(std::memory_order_relaxed), zero = 0;
+        if (k == key || (k == 0 && s.key.compare_exchange_strong(zero, key))) {
+            use = &s;
+            break;
+        }
+    }
+    use->key.store(key, std::memory_order_relaxed);
+    return use;
+}
+
+float occlusionFor(uint64_t key) {
+    uint32_t h = static_cast<uint32_t>((key >> 4) * 2654435761u);
+    for (int i = 0; i < 8; ++i) {
+        const ElevSlot& s = g_elev[(h + i) % kElevSlots];
+        if (s.key.load(std::memory_order_relaxed) != key) continue;
+        return GetTickCount() - s.occlTick.load(std::memory_order_relaxed) < 2000 ? s.occl.load(std::memory_order_relaxed) : 0.0f;
+    }
+    return 0.0f;
+}
+
+void setElevation(const void* panner, float degrees) {
+    if (!panner || !std::isfinite(degrees)) return;
+    uint64_t key = reinterpret_cast<uint64_t>(panner);
+    uint32_t h = static_cast<uint32_t>((key >> 4) * 2654435761u);
+    ElevSlot* use = &g_elev[h % kElevSlots];
+    for (int i = 0; i < 8; ++i) {
+        ElevSlot& s = g_elev[(h + i) % kElevSlots];
+        uint64_t k = s.key.load(std::memory_order_relaxed), zero = 0;
+        if (k == key || (k == 0 && s.key.compare_exchange_strong(zero, key))) {
+            use = &s;
+            break;
+        }
+    }
+    use->key.store(key, std::memory_order_relaxed);
+    use->degrees.store(std::min(90.0f, std::max(-90.0f, degrees)), std::memory_order_relaxed);
+    use->tick.store(GetTickCount(), std::memory_order_relaxed);
+    g_elevUpdates.fetch_add(1, std::memory_order_relaxed);
+    g_elevLast.store(degrees, std::memory_order_relaxed);
+}
+
+float elevationFor(uint64_t key) {
+    uint32_t h = static_cast<uint32_t>((key >> 4) * 2654435761u);
+    for (int i = 0; i < 8; ++i) {
+        const ElevSlot& s = g_elev[(h + i) % kElevSlots];
+        if (s.key.load(std::memory_order_relaxed) != key) continue;
+        return GetTickCount() - s.tick.load(std::memory_order_relaxed) < 2000 ? s.degrees.load(std::memory_order_relaxed) : 0.0f;
+    }
+    return 0.0f;
+}
+
+// Steam Audio render of one block; false = not available for this voice (the built-in model takes it).
+bool renderSteam(HrtfVoice& v, const float* in, float* left, float* right, float angleDeg, float elevDeg, float directness) {
+    IPLBinauralEffect fx = v.fx.load(std::memory_order_relaxed);
+    if (!fx || !g_saReady.load(std::memory_order_relaxed)) return false;
+    float az = angleDeg * 0.017453292f, el = elevDeg * 0.017453292f;  // az grows towards the right
+    if (val(kHrtfFlip) != 0) az = -az;
+    IPLBinauralEffectParams params{};
+    params.direction = {std::sin(az) * std::cos(el), std::sin(el), -std::cos(az) * std::cos(el)};
+    params.interpolation = IPL_HRTFINTERPOLATION_BILINEAR;
+    params.spatialBlend = std::min(1.0f, std::max(0.0f, directness)) * val(kHrtfStrength);
+    params.hrtf = g_sa.hrtf;
+    float* inCh[1] = {const_cast<float*>(in)};
+    float* outCh[2] = {left, right};
+    IPLAudioBuffer inBuf{1, kBlock, inCh}, outBuf{2, kBlock, outCh};
+    g_sa.effectApply(fx, &params, &inBuf, &outBuf);
+    for (int n = 0; n < kBlock; ++n) {
+        left[n] = std::isfinite(left[n]) ? left[n] * 0.8f : 0.0f;
+        right[n] = std::isfinite(right[n]) ? right[n] * 0.8f : 0.0f;
+    }
+    v.last = g_hrtfBlockCount.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+void startSteamAudio() {
+    CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        ULONGLONG t0 = GetTickCount64();
+        std::wstring path = g_folder + L"phonon.dll";
+        HMODULE m = LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+        if (!m) {
+            LOG("Steam Audio: phonon.dll is not next to the mod or cannot be loaded (error %lu): the built-in head model is used",
+                GetLastError());
+            return 0;
+        }
+        g_sa.contextCreate = reinterpret_cast<decltype(g_sa.contextCreate)>(GetProcAddress(m, "iplContextCreate"));
+        g_sa.hrtfCreate = reinterpret_cast<decltype(g_sa.hrtfCreate)>(GetProcAddress(m, "iplHRTFCreate"));
+        g_sa.effectCreate = reinterpret_cast<decltype(g_sa.effectCreate)>(GetProcAddress(m, "iplBinauralEffectCreate"));
+        g_sa.effectApply = reinterpret_cast<decltype(g_sa.effectApply)>(GetProcAddress(m, "iplBinauralEffectApply"));
+        g_sa.effectReset = reinterpret_cast<decltype(g_sa.effectReset)>(GetProcAddress(m, "iplBinauralEffectReset"));
+        if (!g_sa.contextCreate || !g_sa.hrtfCreate || !g_sa.effectCreate || !g_sa.effectApply || !g_sa.effectReset) {
+            LOG("Steam Audio: phonon.dll lacks expected functions (not the 4.8 API?): the built-in head model is used");
+            return 0;
+        }
+        IPLContextSettings cs{};
+        cs.version = STEAMAUDIO_VERSION;
+        cs.simdLevel = IPL_SIMDLEVEL_AVX2;
+        IPLContext context = nullptr;
+        IPLerror err = g_sa.contextCreate(&cs, &context);
+        if (err != IPL_STATUS_SUCCESS || !context) {
+            LOG("Steam Audio: context creation failed (status %d): the built-in head model is used", static_cast<int>(err));
+            return 0;
+        }
+        g_sa.context = context;
+        // hrtf.sofa next to the mod replaces the built-in HRTF (a SOFA file in the SimpleFreeFieldHRIR convention).
+        std::wstring sofaPath = g_folder + L"hrtf.sofa";
+        std::string sofa;
+        if (GetFileAttributesW(sofaPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            int n = WideCharToMultiByte(CP_UTF8, 0, sofaPath.c_str(), -1, nullptr, 0, nullptr, nullptr);
+            sofa.resize(n > 0 ? n - 1 : 0);
+            if (n > 1) WideCharToMultiByte(CP_UTF8, 0, sofaPath.c_str(), -1, &sofa[0], n, nullptr, nullptr);
+        }
+        IPLHRTFSettings hs{};
+        hs.volume = 1.0f;
+        hs.normType = IPL_HRTFNORMTYPE_RMS;
+        IPLHRTF hrtf = nullptr;
+        if (!sofa.empty()) {
+            hs.type = IPL_HRTFTYPE_SOFA;
+            hs.sofaFileName = sofa.c_str();
+            if (g_sa.hrtfCreate(context, &g_sa.audio, &hs, &hrtf) != IPL_STATUS_SUCCESS) {
+                LOG("Steam Audio: hrtf.sofa could not be loaded: the built-in HRTF is used");
+                hrtf = nullptr;
+            }
+        }
+        if (!hrtf) {
+            hs.type = IPL_HRTFTYPE_DEFAULT;
+            hs.sofaFileName = nullptr;
+            if (g_sa.hrtfCreate(context, &g_sa.audio, &hs, &hrtf) != IPL_STATUS_SUCCESS || !hrtf) {
+                LOG("Steam Audio: HRTF creation failed: the built-in head model is used");
+                return 0;
+            }
+        }
+        g_sa.hrtf = hrtf;
+        int made = 0;
+        IPLBinauralEffectSettings es{hrtf};
+        for (HrtfVoice& v : g_hrtf) {
+            IPLBinauralEffect fx = nullptr;
+            if (g_sa.effectCreate(context, &g_sa.audio, &es, &fx) == IPL_STATUS_SUCCESS && fx) {
+                v.fx.store(fx);
+                ++made;
+            }
+        }
+        g_saReady = made > 0;
+        LOG("Steam Audio %d.%d.%d: %s HRTF, %d of %d voice effects ready in %llu ms", STEAMAUDIO_VERSION_MAJOR,
+            STEAMAUDIO_VERSION_MINOR, STEAMAUDIO_VERSION_PATCH, hs.type == IPL_HRTFTYPE_SOFA ? "hrtf.sofa" : "built-in", made,
+            kHrtfVoices, static_cast<unsigned long long>(GetTickCount64() - t0));
+        return 0;
+    }, nullptr, 0, nullptr);
+}
+
+uint64_t panProcess(uint8_t* p, void* ctx, char flag) {
+    g_panCalls.fetch_add(1, std::memory_order_relaxed);
+    uint8_t *inBuf = nullptr, *outBuf = nullptr;
+    float input[kBlock];
+    float angle = 0, directness = 0;
+    uint32_t outChannels = 0;
+    if (val(kHrtf) != 0 && val(kHrtfStrength) > 0) {
+        // +0x324 = the panner's input channels (1 mono source, 2 stereo source), +0x328 = its output channels: the
+        // voice buses are 8-channel (1.129 log: "in 1/2 out 8"), the game folds them to the output mode afterwards.
+        uint32_t in = *reinterpret_cast<uint32_t*>(p + 0x324), out = *reinterpret_cast<uint32_t*>(p + 0x328);
+        g_hrtfLastOut = out, g_hrtfLastIn = in;
+        auto* c = static_cast<uint8_t*>(ctx);
+        uint8_t* ib = *reinterpret_cast<uint8_t**>(c + 0xc490);
+        uint8_t* ob = *reinterpret_cast<uint8_t**>(c + 0xc498);
+        if ((in == 1 || (in >= 2 && in <= 8 && val(kHrtfStereo) != 0)) && out >= 2 && out <= 8 && ib && ob) {
+            auto* id = *reinterpret_cast<float**>(ib + 8);
+            auto* od = *reinterpret_cast<float**>(ob + 8);
+            uint16_t os = *reinterpret_cast<uint16_t*>(ob + 0x12);
+            if (id && od && os >= kBlock) {
+                if (in >= 2) {
+                    // every channel except a lone LFE (8-channel layouts keep it last) is mixed into the one source
+                    uint16_t is = *reinterpret_cast<uint16_t*>(ib + 0x12);
+                    uint32_t used = in == 8 ? 7 : in;
+                    if (is < kBlock) id = nullptr;
+                    else for (int n = 0; n < kBlock; ++n) {
+                        float sum = 0;
+                        for (uint32_t k = 0; k < used; ++k) sum += id[static_cast<size_t>(is) * k + n];
+                        input[n] = sum / static_cast<float>(used);
+                    }
+                } else
+                    std::memcpy(input, id, sizeof(input));
+            }
+            if (id && od && os >= kBlock) {
+                angle = *reinterpret_cast<float*>(p + 0x60);
+                directness = *reinterpret_cast<float*>(p + 0x68);
+                inBuf = ib, outBuf = ob;
+                outChannels = out;
+            }
+        }
+        if (!outBuf) {
+            g_hrtfSkipped.fetch_add(1, std::memory_order_relaxed);
+            g_skipIn = in, g_skipOut = out;  // what the last left-over panner looked like (shown in the log)
+        }
+    }
+    uint64_t result = reinterpret_cast<PanFn>(g_panProcess)(p, ctx, flag);
+    if (outBuf) {
+        auto* od = *reinterpret_cast<float**>(outBuf + 8);
+        uint16_t os = *reinterpret_cast<uint16_t*>(outBuf + 0x12);
+        // The binaural pair goes to the front left and front right of the bus (the game's speaker order: 8/6
+        // channels FL, C, FR, ...; 4 and 2 channels FL, FR) and the rest is silent, so the game's fold-down to
+        // Stereo passes it through as it is.
+        const uint32_t rightIndex = outChannels >= 6 ? 2 : 1;
+        float* left = od;
+        float* right = od + static_cast<size_t>(os) * rightIndex;
+        HrtfVoice& voice = *voiceFor(reinterpret_cast<uint64_t>(p));
+        if (val(kMuffle) != 0 && val(kMuffleAmount) > 0) {
+            // Occlusion comes from the VR mod's pan step (it knows the walls between the sound and you): a one-pole
+            // low-pass whose cutoff falls from open to muffle_treble, plus a level drop, eased over the block.
+            float occ = occlusionFor(reinterpret_cast<uint64_t>(p)) * val(kMuffleAmount);
+            if (occ > 0.001f || voice.occG < 0.999f) {
+                float cutoff = 16000.0f * std::pow(val(kMuffleTreble) / 16000.0f, occ);
+                float a = 1.0f - std::exp(-6.2831853f * cutoff / 48000.0f);
+                float g1 = 1.0f - val(kMuffleLoss) * occ, g0 = voice.occG;
+                for (int n = 0; n < kBlock; ++n) {
+                    float g = g0 + (g1 - g0) * (static_cast<float>(n) / kBlock);
+                    voice.occLp += a * (input[n] - voice.occLp);
+                    input[n] = voice.occLp * g;
+                }
+                voice.occG = g1;
+            } else voice.occLp = input[kBlock - 1];
+        }
+        if (val(kHrtfSA) != 0 &&
+            renderSteam(voice, input, left, right, angle, elevationFor(reinterpret_cast<uint64_t>(p)), directness))
+            g_hrtfSteam.fetch_add(1, std::memory_order_relaxed);
+        else
+            renderBinaural(voice, input, left, right, angle, elevationFor(reinterpret_cast<uint64_t>(p)), directness);
+        if (val(kReverb) != 0 && val(kReverbAmount) > 0) addReverb(voice, input, left, right, directness);
+        for (uint32_t c = 1; c < outChannels; ++c)
+            if (c != rightIndex) std::memset(od + static_cast<size_t>(os) * c, 0, kBlock * sizeof(float));
+        g_hrtfRendered.fetch_add(1, std::memory_order_relaxed);
+    }
+    (void)inBuf;
+    if (val(kPanLog) != 0) {
+        ULONGLONG now = GetTickCount64(), next = g_panNext.load(std::memory_order_relaxed);
+        if (now >= next && g_panNext.compare_exchange_strong(next, now + 250)) samplePanner(p, static_cast<uint8_t*>(ctx), flag);
+    }
+    return result;
+}
+
+void startPanProbe() {
+    if (!g_panSlot) {
+        LOG("Pan probe: the panner's process slot was not found in this build; off");
+        return;
+    }
+    bool ok = swapSlot(g_panSlot, g_panFn, reinterpret_cast<void*>(&panProcess), g_panProcess);
+    LOG("Pan probe: Pan2D1 process (slot 0x%x, function 0x%x) %s; %s", g_panSlot, g_panFn, ok ? "wrapped" : "NOT wrapped",
+        val(kPanLog) != 0 ? "logging" : "log off");
+    if (!ok) return;
+    CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
+        int lines = 0;
+        for (;;) {
+            Sleep(10000);
+            uint32_t rendered = g_hrtfRendered.exchange(0), skipped = g_hrtfSkipped.exchange(0), steam = g_hrtfSteam.exchange(0);
+            if (val(kHrtf) != 0 && (rendered || skipped) && lines < 60)
+                LOG("3D sound: %u panner blocks made binaural (%u by Steam Audio), %u left to the game (last seen: %u in, %u out channels); "
+                    "height from the VR mod: %u updates (last %.1f deg); last left over: %u in, %u out%s",
+                    rendered, steam, skipped, g_hrtfLastIn.load(), g_hrtfLastOut.load(),
+                    g_elevUpdates.exchange(0), g_elevLast.load(), g_skipIn.load(), g_skipOut.load(),
+                    !rendered && skipped ? " - only mono sources are made binaural; stereo sources keep the game's pan" : "");
+            uint32_t calls = g_panCalls.exchange(0), n = std::min<uint32_t>(g_panTaken.load(std::memory_order_acquire), kPanRing);
+            if (val(kPanLog) == 0 || !calls) {
+                g_panTaken.store(0);
+                continue;
+            }
+            if (lines < 40) {
+                ++lines;
+                LOG("Pan probe: %u panner runs in 10 s, %u sampled", calls, n);
+                for (uint32_t i = 0; i < n && i < 12; ++i) {
+                    const PanSample& s = g_panRing[i];
+                    LOG("Pan probe:   panner 0x%llx in %u out %u angle %.3f distance %.3f third %.3f stride %u peak %.4f flag %u",
+                        static_cast<unsigned long long>(s.panner), s.in, s.out, s.angle, s.distance, s.third, s.stride, s.peak,
+                        s.flag);
+                }
+            }
+            g_panTaken.store(0);
         }
     }, nullptr, 0, nullptr);
 }
@@ -984,7 +1770,20 @@ PyObject* pyKeyName(PyObject*, PyObject* args) {
     return py.Py_BuildValue("u", name);
 }
 
+// set_room(volume_m3, absorption): the script's own estimate of the room around the listener.
+PyObject* pySetRoom(PyObject*, PyObject* args) {
+    double vol = 0, ab = 0;
+    if (!py.PyArg_ParseTuple(args, "dd", &vol, &ab)) return nullptr;
+    if (std::isfinite(vol) && std::isfinite(ab)) {
+        g_pyRoomVolume.store(static_cast<float>(vol));
+        g_pyRoomAbsorb.store(static_cast<float>(ab));
+        g_pyRoomTick.store(GetTickCount());
+    }
+    return none();
+}
+
 PyMethodDef methods[] = {
+    {"set_room", pySetRoom, METH_VARARGS, "set_room(volume_m3, absorption 0..1): the room around the listener"},
     {"menu", pyMenu, METH_NOARGS, "menu() -> the menu rows as text"},
     {"capture", pyCapture, METH_VARARGS, "capture(1) listen for a new menu key; capture(0) -> the key pressed"},
     {"key_name", pyKeyName, METH_VARARGS, "key_name(vk) -> the key's name"},
@@ -1027,6 +1826,8 @@ void start() {
         buildVtables();
         startMixer();
         startClarity();
+        startPanProbe();
+        startSteamAudio();
         startHotkey();
     }
 }
@@ -1061,6 +1862,19 @@ extern "C" __declspec(dllexport) int esc_quiet(const char* what, float gain) {
     if (g_quietMusic.exchange(gain) != gain) LOG("Music held at %.0f %% by another mod (esc_quiet)", gain * 100);
     return g_named.load() && g_busCount.load() > 0 ? 1 : 0;
 }
+// For the VR mod's pan step: a panner's elevation in degrees (+ up, - down) for Steam Audio's height cue.
+// The room the listener is in: volume in cubic metres, absorption 0 (bare, hard) .. 1 (carpets, furniture, curtains).
+// Refresh it at least every 2 s, otherwise the menu's size and damping apply.
+extern "C" __declspec(dllexport) void esc_set_room(float volumeM3, float absorption) {
+    if (!std::isfinite(volumeM3) || !std::isfinite(absorption)) return;
+    g_roomVolume.store(volumeM3, std::memory_order_relaxed);
+    g_roomAbsorb.store(absorption, std::memory_order_relaxed);
+    g_roomTick.store(GetTickCount(), std::memory_order_relaxed);
+}
+// How much of the sound between this panner and the listener is walls, floors or closed doors: 0 clear .. 1 fully
+// blocked. Refresh at least every 2 s, otherwise 0 applies.
+extern "C" __declspec(dllexport) void esc_set_occlusion(const void* panner, float amount) { setOcclusion(panner, amount); }
+extern "C" __declspec(dllexport) void esc_set_elevation(const void* panner, float degrees) { setElevation(panner, degrees); }
 // The settings menu as rows of text (src/menu.inc, format in jiggle/docs/MENU-EXPORT.md); values through esc_get / esc_set.
 extern "C" __declspec(dllexport) const wchar_t* esc_menu() { return kMenu; }
 // The names used while the mod was called Claude Sound.

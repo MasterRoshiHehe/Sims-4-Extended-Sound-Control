@@ -7,12 +7,13 @@ Console (Ctrl+Shift+C): esc.menu | esc.boost <percent> | esc.clarity <0/1> [floo
 """
 import os
 
-VERSION = '0.6.2'
+VERSION = '0.9.5'
 DLL_NAME = 'extendedsoundcontrol.dll'
 
 _mod = None
 _probed_lots = 0
 _hotkey_alarm = None
+_room_alarm = None
 
 
 class _AlarmOwner:
@@ -97,6 +98,79 @@ def _install():
     zone.Zone.on_loading_screen_animation_finished = on_loading_screen_animation_finished
 
 
+# --- Room size for the reverb, from the game's own room data (build_buy.get_block_id = the room a spot is in). ---
+STEP = 1.0           # metres between sampled cells
+MAX_CELLS = 600
+CEILING = 2.8        # a standard wall is about this tall
+_rooms = {}          # (block, level) -> (time, volume, absorption)
+_last_room_log = None
+
+
+def _room_for(sim, zone_id):
+    import build_buy
+    import sims4.math
+    import services
+    pos = sim.position
+    level = sim.routing_surface.secondary_id
+    if build_buy.is_location_outside(pos, level):
+        return 3000.0, 0.1, 'outside'
+    block = build_buy.get_block_id(zone_id, pos, level)
+    if not block:
+        return 3000.0, 0.1, 'no room'
+    import time
+    cached = _rooms.get((block, level))
+    if cached is not None and time.time() - cached[0] < 60:
+        return cached[1], cached[2], 'room {} (cached)'.format(block)
+    seen = set()
+    todo = [(0, 0)]
+    seen.add((0, 0))
+    while todo and len(seen) < MAX_CELLS:
+        i, j = todo.pop()
+        for di, dj in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            n = (i + di, j + dj)
+            if n in seen:
+                continue
+            p = sims4.math.Vector3(pos.x + n[0] * STEP, pos.y, pos.z + n[1] * STEP)
+            if build_buy.get_block_id(zone_id, p, level) == block:
+                seen.add(n)
+                todo.append(n)
+    area = len(seen) * STEP * STEP
+    volume = area * CEILING
+    # furnishings: objects standing in the room soak up sound
+    count = 0
+    try:
+        for obj in services.object_manager().get_all():
+            op = getattr(obj, 'position', None)
+            if op is None or getattr(obj, 'is_sim', False):
+                continue
+            if abs(op.y - pos.y) > 1.5:
+                continue
+            if (int(round((op.x - pos.x) / STEP)), int(round((op.z - pos.z) / STEP))) in seen:
+                count += 1
+    except Exception as e:
+        _log('Room objects: {!r}'.format(e))
+    absorption = min(0.9, 0.2 + 0.7 * min(1.0, count / max(1.0, area * 0.5)))
+    _rooms[(block, level)] = (time.time(), volume, absorption)
+    return volume, absorption, 'room {}: {:.0f} m2, {} objects'.format(block, area, count)
+
+
+def _room_tick(_handle):
+    global _last_room_log
+    try:
+        import services
+        sim = services.get_active_sim()
+        zone_id = services.current_zone_id()
+        if sim is None or _mod is None:
+            return
+        volume, absorption, why = _room_for(sim, zone_id)
+        _mod.set_room(volume, absorption)
+        if why != _last_room_log and not why.endswith('(cached)'):
+            _last_room_log = why
+            _log('Room for reverb: {} -> {:.0f} m3, absorption {:.2f}'.format(why, volume, absorption))
+    except Exception as e:
+        _log('Room estimate failed: {!r}'.format(e))
+
+
 def _open_menu():
     try:
         from extendedsoundcontrol import menu
@@ -126,6 +200,13 @@ def _start_hotkey():
             _log('Hotkey failed: {!r}'.format(e))
 
     _hotkey_alarm = alarms.add_alarm_real_time(_alarm_owner, clock.interval_in_real_seconds(0.25), tick, repeating=True)
+    global _room_alarm
+    if _room_alarm is not None:
+        try:
+            alarms.cancel_alarm(_room_alarm)
+        except Exception:
+            pass
+    _room_alarm = alarms.add_alarm_real_time(_alarm_owner, clock.interval_in_real_seconds(1.0), _room_tick, repeating=True)
 
 
 def _status_text():
