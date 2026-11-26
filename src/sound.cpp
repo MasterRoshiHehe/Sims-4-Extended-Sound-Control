@@ -1362,6 +1362,17 @@ ElevSlot* slotFor(uint64_t key) {
             use = &s;
             break;
         }
+        // a slot nobody has refreshed for 5 s belongs to a sound that is gone: take it over (before, dead sounds
+        // kept their slots for ever, the table filled up and live sounds shared a slot, so one sound could get
+        // another's height or muffling)
+        const uint32_t now = GetTickCount();
+        if (now - s.tick.load(std::memory_order_relaxed) > 5000 && now - s.occlTick.load(std::memory_order_relaxed) > 5000 &&
+            s.key.compare_exchange_strong(k, key)) {
+            s.occl.store(0, std::memory_order_relaxed);
+            s.degrees.store(0, std::memory_order_relaxed);
+            use = &s;
+            break;
+        }
     }
     use->key.store(key, std::memory_order_relaxed);
     return use;
@@ -1380,17 +1391,7 @@ float occlusionFor(uint64_t key) {
 void setElevation(const void* panner, float degrees) {
     if (!panner || !std::isfinite(degrees)) return;
     uint64_t key = reinterpret_cast<uint64_t>(panner);
-    uint32_t h = static_cast<uint32_t>((key >> 4) * 2654435761u);
-    ElevSlot* use = &g_elev[h % kElevSlots];
-    for (int i = 0; i < 8; ++i) {
-        ElevSlot& s = g_elev[(h + i) % kElevSlots];
-        uint64_t k = s.key.load(std::memory_order_relaxed), zero = 0;
-        if (k == key || (k == 0 && s.key.compare_exchange_strong(zero, key))) {
-            use = &s;
-            break;
-        }
-    }
-    use->key.store(key, std::memory_order_relaxed);
+    ElevSlot* use = slotFor(key);
     use->degrees.store(std::min(90.0f, std::max(-90.0f, degrees)), std::memory_order_relaxed);
     use->tick.store(GetTickCount(), std::memory_order_relaxed);
     g_elevUpdates.fetch_add(1, std::memory_order_relaxed);
